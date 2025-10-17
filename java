@@ -310,7 +310,7 @@ for (const row of rows){
   const cat = catRaw.toUpperCase();
   if (cat === ccPaymentCat) continue;              // ← exclude CC payment from category rollup
 
-  const aep = Math.max(_.n(row[idxAct]), _.n(row[idxPred]));
+  const aep = Math.max(_.n(row[iAct]), _.n(row[iPred]));
   if (aep>0) catTotals.set(catRaw, (catTotals.get(catRaw)||0) + aep);
 }
 
