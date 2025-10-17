@@ -302,28 +302,18 @@ function Expenses_UpdateCategories_INO(){
   const iPred = _.c(t.colPred)-_.c(t.colCat);
   const iAct  = _.c(t.colAct) -_.c(t.colCat);
 
-  const ccPaymentCat = (CFG.creditCards && CFG.creditCards.paymentCategory || "Credit Card Payment").toUpperCase();
-// ...
-for (const row of rows){
-  const catRaw = String(row[0]||"").trim();
-  if (!catRaw) continue;
-  const cat = catRaw.toUpperCase();
-  if (cat === ccPaymentCat) continue;              // ← exclude CC payment from category rollup
 
-  const aep = Math.max(_.n(row[idxAct]), _.n(row[idxPred]));
-  if (aep>0) catTotals.set(catRaw, (catTotals.get(catRaw)||0) + aep);
+
+
+
+const incomeAEP = _.sumAEP_block(sh, CFG.monthly.incomeTable.rowStart, CFG.monthly.incomeTable.rowEnd, CFG.monthly.incomeTable.colPred, CFG.monthly.incomeTable.colAct);
+const map=new Map();
+
+for (const r of rows){
+  const cat=String(r[0]||"").trim(); if(!cat) continue;
+  const aep = (_.n(r[iAct])>0?_.n(r[iAct]):_.n(r[iPred]));
+  if (aep>0) map.set(cat,(map.get(cat)||0)+aep);
 }
-
-
-  const incomeAEP = _.sumAEP_block(sh, CFG.monthly.incomeTable.rowStart, CFG.monthly.incomeTable.rowEnd, CFG.monthly.incomeTable.colPred, CFG.monthly.incomeTable.colAct);
-  const map=new Map();
-
-  for (const r of rows){
-    const cat=String(r[0]||"").trim(); if(!cat) continue;
-    const aep = (_.n(r[iAct])>0?_.n(r[iAct]):_.n(r[iPred]));
-    if (aep>0) map.set(cat,(map.get(cat)||0)+aep);
-  }
-
   const sorted=[...map.entries()].sort((a,b)=>b[1]-a[1]);
   const outH = E.rowEnd-E.rowStart+1;
   const outW = _.c(E.colPct)-_.c(E.colLabel)+1;
@@ -3342,6 +3332,19 @@ function onOpen(){
   try { Lists_ApplyValidations(); } catch(_) {}
 
 }
+
+function onSheetActivate(e) {
+  if (!e || !e.activeSheet) return;
+  
+  const sh = e.activeSheet;
+  const sheetName = sh.getName();
+  
+  // Don't reset certain sheets if needed
+  if (sheetName === "_Lists") return;
+  
+  // Reset to A1 whenever a sheet is activated via tab click
+  sh.getRange("A1").activate();
+}
 function onSelectionChange(e) {
   if (!e || !e.range) return;
 
@@ -3353,7 +3356,20 @@ function onSelectionChange(e) {
   const topLeftA1 = sh.getRange(row, col).getA1Notation();
   const a1 = sh.getRange(row, col).getA1Notation(); // <-- use this everywhere
 
-  // === NAVIGATION - run first and short-circuit ===
+// === RESET TO A1 ON TAB CLICK ===
+  try {
+    if (!_lastActiveSheet) var _lastActiveSheet = "";
+    
+    if (_lastActiveSheet !== "" && _lastActiveSheet !== sheetName) {
+      // Sheet just changed - reset to A1
+      sh.getRange("A1").activate();
+      _lastActiveSheet = sheetName;
+      return;
+    }
+    _lastActiveSheet = sheetName;
+  } catch(_) {}
+
+  // === NAVIGATION ===
   try {
     const navMap = {
       "C2": "Month",
@@ -3363,11 +3379,18 @@ function onSelectionChange(e) {
       "C28": "Transfers",
       "C29": "Dated Account Balance"
     };
+    
     if (navMap[a1] && sh.getName() !== "_Lists") {
       const target = navMap[a1];
       const ss = SpreadsheetApp.getActive();
       const t = ss.getSheetByName(target);
-      if (t) { ss.setActiveSheet(t); t.getRange("A1").activate(); SpreadsheetApp.flush(); return; }
+      
+      if (t) { 
+        sh.getRange("A1").activate();
+        ss.setActiveSheet(t); 
+        t.getRange("A1").activate(); 
+        return; 
+      }
     }
   } catch(_) {}
 
