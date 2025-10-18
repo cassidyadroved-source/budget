@@ -1567,8 +1567,12 @@ function populateMonth(sh, year, mIdx, _allowPast, mainRows){
 
     // Calculate THIS month's predicted using calendar occurrences
     const pred = calculateMonthlyPredicted(m.freq, m.contrib, year, mIdx, m.start);
-    const bal = (m.startAmt || 0) + pred;
-    const pct = (m.goalAmt > 0) ? Math.min(1, Math.max(0, bal / m.goalAmt)) : 0;
+   // Calculate accumulated balance (start + all contributions to date)
+const monthlyEq = getMonthlyEquivalent(m.freq, m.contrib);
+const monthsSinceStart = m.start ? ((year - m.start.getFullYear()) * 12 + (mIdx - (m.start.getMonth() + 1))) : 0;
+const totalContributed = Math.max(0, monthlyEq * monthsSinceStart);
+const bal = (m.startAmt || 0) + totalContributed;
+const pct = (m.goalAmt > 0) ? Math.min(1, Math.max(0, bal / m.goalAmt)) : 0;
 
     const row = M.rowStart + r;
     sh.getRange(row, _.c(M.colName)).setValue(m.name);
@@ -1578,7 +1582,6 @@ function populateMonth(sh, year, mIdx, _allowPast, mainRows){
     sh.getRange(row, _.c(M.colPct)).setValue(pct);
 
     const remaining = Math.max(0, (m.goalAmt || 0) - bal);
-    const monthlyEq = getMonthlyEquivalent(m.freq, m.contrib);
     if (remaining > 0 && monthlyEq > 0){
       const monthsToFinish = Math.ceil(remaining / monthlyEq);
       const finish = new Date(year, mIdx - 1, 1);
@@ -1957,18 +1960,16 @@ function refreshSourceData(isH2Change){
   const existingIncludes = new Map();
   
 
-    if (!isH2Change) {
-  for (const r of existing) {
-    const nm   = String(r[iName] || "").trim();
-    const dt   = _.toDate(r[iDate]);
-    const pred = _.n(r[iPred]);
-    const act  = _.n(r[iAct]);
-    const acct = String(r[iAcct] || "").trim();
-    if (nm && dt) {
-      const key = _expKey(nm, dt, pred, acct);
-      if (act > 0) existingActuals.set(key, act);
-      existingIncludes.set(key, r[iInc] === true);
-    }
+   for (const r of existing) {
+  const nm   = String(r[iName] || "").trim();
+  const dt   = _.toDate(r[iDate]);
+  const pred = _.n(r[iPred]);
+  const act  = _.n(r[iAct]);
+  const acct = String(r[iAcct] || "").trim();
+  if (nm && dt) {
+    const key = _expKey(nm, dt, pred, acct);
+    if (act > 0) existingActuals.set(key, act);
+    existingIncludes.set(key, r[iInc] === true);  // ✅ Fixed
   }
 }
   
@@ -2597,20 +2598,38 @@ try {
     xferByAcct.set(t.to,   (xferByAcct.get(t.to)||0)   + t.amount);
   }
 
-  // Write P/T/W/Y and money formats
-  const outExp=[], outInc=[], outXf=[], outEnd=[];
-  for (let i=0;i<accounts.length;i++){
-    const acc   = accounts[i];
-    if (!acc){ outExp.push([""]); outInc.push([""]); outXf.push([""]); outEnd.push([""]); continue; }
-    const inc   = incByAcct.get(acc)  || 0;
-    const exp   = expByAcct.get(acc)  || 0;
-    const xfers = xferByAcct.get(acc) || 0;
-    const begin = predBegins[i]       || 0;
+// Write P/T/W/Y and money formats
+const outExp=[], outInc=[], outXf=[], outEnd=[];
 
-    outExp.push([exp]);
+// Get CC charge/payment splits
+const ccSplits = _CC_computeExpenseSplits_();
+
+for (let i=0;i<accounts.length;i++){
+  const acc = accounts[i];
+  if (!acc){ outExp.push([""]); outInc.push([""]); outXf.push([""]); outEnd.push([""]); continue; }
+  
+  const inc = incByAcct.get(acc) || 0;
+  const xfers = xferByAcct.get(acc) || 0;
+  const begin = predBegins[i] || 0;
+  
+  let exp, endBalance;
+  
+  if (isCC.get(acc)) {
+    // CC account: charges ADD to balance (you owe more), payments SUBTRACT (paying it off)
+    const charges = ccSplits.chargesByAcct.get(acc) || 0;
+    const payments = ccSplits.paymentsByAcct.get(acc) || 0;
+    exp = charges; // Only show charges as "expenses" for CC
+    endBalance = begin + charges - payments + xfers;
+  } else {
+    // Regular account: all expenses SUBTRACT from balance
+    exp = expByAcct.get(acc) || 0;
+    endBalance = begin + inc - exp + xfers;
+  }
+  
+  outExp.push([exp]);
   outInc.push([inc]);
   outXf.push([xfers]);
-  outEnd.push([begin + inc - exp + xfers]);
+  outEnd.push([endBalance]);
 }
 
 sh.getRange(B.rowStart, _.c(B.colExpTotal),    n, 1).setValues(outExp);
@@ -2704,6 +2723,16 @@ sh.getRange(B.rowStart, _.c(B.colPredEnd),     n, 1).setValues(outEnd);
 
     sh.getRange(T.subs).setValue(subsTotal).setNumberFormat(CFG.formats.money);
   })();
+  // ADD THIS at the end of Monthly_UpdateBankAndCategoryFormatting
+// Write Expense sheet tiles
+try {
+  const expSh = ss.getSheetByName(CFG.expenses.master.sheet);
+  if (expSh) {
+    expSh.getRange("H2").setValue(monthTotalNoCCPay).setNumberFormat(CFG.formats.money);
+    expSh.getRange("H6").setValue(monthTotalNoCCPay + monthTotalCCPay).setNumberFormat(CFG.formats.money);
+    expSh.getRange("M6").setValue(monthTotalCCPay).setNumberFormat(CFG.formats.money);
+  }
+} catch(_) {}
 }
 
 /* ============================= “TILES ONLY” REFRESH (fast path for onEdit) ============================= */
@@ -2713,7 +2742,6 @@ function _updateTilesOnly(){
 
 /* ============================= OPTIONAL: PUBLIC COMPOSER ============================= */
 function Monthly_UpdateAllTiles(){
-  Monthly_RenderCalendar();                  // calendar grid
   Monthly_UpdateBankAndCategoryFormatting(); // bank + category table + top tiles
 }
 
@@ -3333,167 +3361,119 @@ function onOpen(){
 
 }
 
-function onSheetActivate(e) {
-  if (!e || !e.activeSheet) return;
-  
-  const sh = e.activeSheet;
-  const sheetName = sh.getName();
-  
-  // Don't reset certain sheets if needed
-  if (sheetName === "_Lists") return;
-  
-  // Reset to A1 whenever a sheet is activated via tab click
-  sh.getRange("A1").activate();
-}
+
+
 function onSelectionChange(e) {
   if (!e || !e.range) return;
 
-  const range = e.range;
-  const sh = range.getSheet();
-  const sheetName = sh.getName();
-  const row = range.getRow();
-  const col = range.getColumn();
-  const topLeftA1 = sh.getRange(row, col).getA1Notation();
-  const a1 = sh.getRange(row, col).getA1Notation(); // <-- use this everywhere
-
-// === RESET TO A1 ON TAB CLICK ===
   try {
-    if (!_lastActiveSheet) var _lastActiveSheet = "";
+    const range = e.range;
+    const sh = range.getSheet();
+    const sheetName = sh.getName();
+    const row = range.getRow();
+    const col = range.getColumn();
     
-    if (_lastActiveSheet !== "" && _lastActiveSheet !== sheetName) {
-      // Sheet just changed - reset to A1
-      sh.getRange("A1").activate();
-      _lastActiveSheet = sheetName;
+    
+    // === DATED H2 ===
+    if (sheetName === "Dated Account Balance" && cellA1 === "H2") {
+      const d = _.toDate(sh.getRange("H2").getValue());
+      if (!d) return;
+
+      const stamp = Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
+      const last = STATE.get("H2_LAST");
+      if (stamp === last) return;
+
+      STATE.set("H2_LAST", stamp);
+      sh.getRange("K2").setValue("Updating...");
+      SpreadsheetApp.flush();
+      DATED_ACCOUNT_BALANCE.refreshSourceData(false);
+      sh.getRange("K2").clearContent();
       return;
     }
-    _lastActiveSheet = sheetName;
-  } catch(_) {}
 
-  // === NAVIGATION ===
-  try {
-    const navMap = {
-      "C2": "Month",
-      "C3": "Income",
-      "C4": "Expenses",
-      "C5": "Savings",
-      "C28": "Transfers",
-      "C29": "Dated Account Balance"
-    };
-    
-    if (navMap[a1] && sh.getName() !== "_Lists") {
-      const target = navMap[a1];
-      const ss = SpreadsheetApp.getActive();
-      const t = ss.getSheetByName(target);
-      
-      if (t) { 
-        sh.getRange("A1").activate();
-        ss.setActiveSheet(t); 
-        t.getRange("A1").activate(); 
-        return; 
+    // === CALENDAR OVERFLOW ===
+    if (sheetName !== "Month") return;
+
+    const C = CFG.monthly.calendar;
+    const calLeft = _.c("C");
+    const calRight = _.c("AJ");
+    const calTop = C.startRow;
+    const calBottom = calTop + (C.perDayHeight * 6) - 1;
+
+    const RAB = _panelRect("AB");
+    const RAG = _panelRect("AG");
+
+    if (cellA1 === RAB.headerA1) {
+      const raw = STATE.get("OV_PANEL_AB");
+      if (raw) {
+        const p = JSON.parse(raw);
+        _renderPanel("AB", p.y, p.m, p.day, p.items);
       }
+      return;
     }
-  } catch(_) {}
 
-  // === DATED H2 ===
-  if (sheetName === CFG.datedAccountBalance.sheet && a1 === "H2") {
-    const d = _.toDate(sh.getRange("H2").getValue());
-    if (!d) return;
-
-    const stamp = Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
-    const last = STATE.get("H2_LAST");
-    if (stamp === last) return;
-
-    STATE.set("H2_LAST", stamp);
-    sh.getRange("K2").setValue("Updating...");
-    SpreadsheetApp.flush();
-    DATED_ACCOUNT_BALANCE.refreshSourceData(false);  // preserve actuals
-    sh.getRange("K2").clearContent();
-    return;
-  }
-
-  // === CALENDAR OVERFLOW ===
-  if (sheetName !== CFG.singleMonth.sheet) return;
-
-  const C = CFG.monthly.calendar;
-  const calLeft = _.c("C");
-  const calRight = _.c("AJ");
-  const calTop = C.startRow;
-  const calBottom = calTop + (C.perDayHeight * 6) - 1;
-
-  if (row < calTop || row > calBottom || col < calLeft || col > calRight) {
-    clearOverflowPanels();
-    return;
-  }
-
-  const RAB = _panelRect("AB");
-  const RAG = _panelRect("AG");
-
-  if (a1 === RAB.headerA1) {
-    const raw = STATE.get("OV_PANEL_AB");
-    if (raw) {
-      const p = JSON.parse(raw);
-      _renderPanel("AB", p.y, p.m, p.day, p.items);
+    if (cellA1 === RAG.headerA1) {
+      const raw = STATE.get("OV_PANEL_AG");
+      if (raw) {
+        const p = JSON.parse(raw);
+        _renderPanel("AG", p.y, p.m, p.day, p.items);
+      }
+      return;
     }
-    return;
-  }
 
-  if (a1 === RAG.headerA1) {
-    const raw = STATE.get("OV_PANEL_AG");
-    if (raw) {
-      const p = JSON.parse(raw);
-      _renderPanel("AG", p.y, p.m, p.day, p.items);
+    const contentH = 6;
+    const inAB = row >= RAB.rowStart && row <= RAB.rowEnd && col >= RAB.left && col < (RAB.left + RAB.width);
+    const inAG = row >= RAG.rowStart && row <= RAG.rowEnd && col >= RAG.left && col < (RAG.left + RAG.width);
+    if (inAB || inAG) return;
+
+    if (row < calTop || row > calBottom || col < calLeft || col > calRight) {
+      clearOverflowPanels();
+      return;
     }
-    return;
+
+    const weekIdx = Math.floor((row - C.startRow) / C.perDayHeight);
+    if (weekIdx < 0 || weekIdx > 5) { clearOverflowPanels(); return; }
+
+    const dayTop = C.startRow + weekIdx * C.perDayHeight;
+    const plusRow = dayTop + (contentH - 1);
+    if (row !== plusRow) { clearOverflowPanels(); return; }
+
+    const colLtr = cellA1.replace(/\d+/g, "");
+    const dgi = _groupIndexForCol(colLtr);
+    if (dgi < 0) { clearOverflowPanels(); return; }
+
+    const [cStart] = C.dayColGroups[dgi];
+    const firstCol = _.c(cStart);
+    const cellValue = String(sh.getRange(plusRow, firstCol).getValue() || "").trim();
+    if (!/^\+\d+\s+more$/.test(cellValue)) { clearOverflowPanels(); return; }
+
+    const y = _.year();
+    const m = _.monthIdx();
+    const firstDow = new Date(y, m - 1, 1).getDay();
+    const idx = weekIdx * 7 + dgi;
+    const dayNum = 1 + idx - firstDow;
+    const dim = new Date(y, m, 0).getDate();
+    if (dayNum < 1 || dayNum > dim) { clearOverflowPanels(); return; }
+
+    const occExp = EXPENSES.computeOccurrences(EXPENSES.readMaster(), y, m)
+      .filter(o => o.date.getDate() === dayNum)
+      .map(o => ({ name: o.name, amount: o.amt }));
+
+    const occXfer = TRANSFERS.readAndExpandForMonth(y, m)
+      .filter(t => t.date.getDate() === dayNum)
+      .map(t => ({ name: `Transfer: ${t.name}`, amount: t.amount }));
+
+    const items = occExp.concat(occXfer).sort((a, b) => b.amount - a.amount);
+    const visN = C.visibleLines || 4;
+    if (items.length <= visN) { clearOverflowPanels(); return; }
+
+    const side = (dgi >= 4) ? "AG" : "AB";
+    _renderPanel(side, y, m, dayNum, items);
+    
+  } catch(err) {
+    Logger.log("onSelectionChange ERROR: " + err);
   }
-
-  const inAB = row >= RAB.rowStart && row <= RAB.rowEnd && col >= RAB.left && col < (RAB.left + RAB.width);
-  const inAG = row >= RAG.rowStart && row <= RAG.rowEnd && col >= RAG.left && col < (RAG.left + RAG.width);
-  if (inAB || inAG) return;
-
-  const contentH = 6;
-  const weekIdx = Math.floor((row - C.startRow) / C.perDayHeight);
-  if (weekIdx < 0 || weekIdx > 5) { clearOverflowPanels(); return; }
-
-  const dayTop = C.startRow + weekIdx * C.perDayHeight;
-  const plusRow = dayTop + (contentH - 1);
-  if (row !== plusRow) { clearOverflowPanels(); return; }
-
-  const cellA1 = sh.getRange(row, col).getA1Notation();
-  const colLtr = cellA1.replace(/\d+/g, "");
-  const dgi = _groupIndexForCol(colLtr);
-  if (dgi < 0) { clearOverflowPanels(); return; }
-
-  const [cStart] = C.dayColGroups[dgi];
-  const firstCol = _.c(cStart);
-  const cellValue = String(sh.getRange(plusRow, firstCol).getValue() || "").trim();
-  if (!/^\+\d+\s+more$/.test(cellValue)) { clearOverflowPanels(); return; }
-
-  const y = _.year();
-  const m = _.monthIdx();
-  const firstDow = new Date(y, m - 1, 1).getDay();
-  const idx = weekIdx * 7 + dgi;
-  const dayNum = 1 + idx - firstDow;
-  const dim = new Date(y, m, 0).getDate();
-  if (dayNum < 1 || dayNum > dim) { clearOverflowPanels(); return; }
-
-  const occExp = EXPENSES.computeOccurrences(EXPENSES.readMaster(), y, m)
-    .filter(o => o.date.getDate() === dayNum)
-    .map(o => ({ name: o.name, amount: o.amt }));
-
-  const occXfer = TRANSFERS.readAndExpandForMonth(y, m)
-    .filter(t => t.date.getDate() === dayNum)
-    .map(t => ({ name: `Transfer: ${t.name}`, amount: t.amount }));
-
-  const items = occExp.concat(occXfer).sort((a, b) => b.amount - a.amount);
-  const visN = C.visibleLines || 4;
-  if (items.length <= visN) { clearOverflowPanels(); return; }
-
-  const side = (dgi >= 4) ? "AG" : "AB";
-  _renderPanel(side, y, m, dayNum, items);
 }
-
-
-
  function onEdit(e){
   if (!e || !e.range) return;
 
@@ -3656,7 +3636,6 @@ if (e && e.range && e.range.getSheet().getName() === "_Lists") {
     if (mSh){
       const y=_.year(), mIdx=_.monthIdx();
       EXPENSES.populateMonth(mSh, y, mIdx, true, EXPENSES.readMaster());
-      Monthly_RenderCalendar();
       Expenses_UpdateSheetTiles();
       DATED_ACCOUNT_BALANCE.refreshSourceData(false);
       DATED_ACCOUNT_BALANCE.updateDatedAccountBalance();
@@ -3723,7 +3702,14 @@ try { Monthly_UpdateBankAndCategoryFormatting(); } catch(_){}
   }
 }
 
-
+function debugSheetNames() {
+  const ss = SpreadsheetApp.getActive();
+  const sheets = ss.getSheets();
+  Logger.log("=== ALL SHEET NAMES ===");
+  sheets.forEach(function(sheet) {
+    Logger.log("Sheet: '" + sheet.getName() + "'");
+  });
+}
 
 
 /* ============================= MENU ============================= */
