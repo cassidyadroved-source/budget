@@ -227,14 +227,7 @@ lists: {
     }
   }
 };
-var CALL_TRACKER = {
-  updateAll: 0,
-  updateIncomeTiles: 0,
-  Expenses_UpdateSheetTiles: 0,
-  Monthly_UpdateBankAndCategoryFormatting: 0,
-  recomputeTiles: 0
-};
-// ---- Cached Spreadsheet accessor ----
+
 var __ssCached = null;
 function __ss() {
   return __ssCached || (__ssCached = SpreadsheetApp.getActive());
@@ -3359,15 +3352,7 @@ function _shouldRun_(key, ms){
   p.setProperty(key, String(now));
   return true;
 }
-// Helper function
-function showUpdating(message) {
-  const ss = __ss();;
-  const toast = ss.toast(message || "Updating...", "Budget Tracker", -1);  // -1 = stays until dismissed
-}
 
-function hideUpdating() {
-  SpreadsheetApp.getActiveSpreadsheet().toast("Done!", "Budget Tracker", 1);
-}
 function ordinal(n) {
   const s = ["th", "st", "nd", "rd"];
   const v = n % 100;
@@ -3415,71 +3400,6 @@ function Lists_SyncCreditCardPayment() {
   
   Lists_ApplyValidations();
 }
-
-
-// ADD THESE THREE FUNCTIONS RIGHT HERE:
-// === Helpers (cache, column offset, first occurrence in month) ===
-if (typeof __ss !== 'function') {
-  var __ss_cache = null;
-  function __ss() {
-    return (__ss_cache && __ss_cache.getId) ? __ss_cache : (__ss_cache = SpreadsheetApp.getActive());
-  }
-}
-
-if (typeof _idxOrNeg !== 'function') {
-  // Returns 0-based offset of `maybeCol` relative to `baseCol`, or -1 if not present.
-  function _idxOrNeg(baseCol, maybeCol) {
-    if (!maybeCol) return -1;
-    try { return _.c(maybeCol) - _.c(baseCol); } catch(_) { return -1; }
-  }
-}
-
-if (typeof _firstOccurrenceTimeInMonth !== 'function') {
-  // Compute first occurrence (ms epoch) of a recurring item within (y, m=1..12),
-  // anchored at `start`. Returns { firstTime, periodMs }. -1 if none.
-  function _firstOccurrenceTimeInMonth(freq, start, y, m) {
-    const F = _.normFreq(freq);
-    const s = start ? new Date(start) : new Date(y, 0, 1);
-    const monthStart = new Date(y, m - 1, 1).getTime();
-    const monthEnd   = new Date(y, m,     1).getTime(); // exclusive
-
-    if (F === "ONETIME") {
-      const st = s.getTime();
-      return (st >= monthStart && st < monthEnd) ? { firstTime: st, periodMs: 0 }
-                                                 : { firstTime: -1, periodMs: 0 };
-    }
-
-    if (F === "MONTHLY") {
-      const dom = s.getDate();
-      const dim = new Date(y, m, 0).getDate();
-      const d   = Math.min(dom, dim);
-      const t   = new Date(y, m - 1, d).getTime();
-
-      // If the anchor itself is inside this month and after the anchored day, no hit.
-      if (s.getFullYear() === y && (s.getMonth() + 1) === m && t < s.getTime()) {
-        return { firstTime: -1, periodMs: 0 };
-      }
-      return (t >= monthStart && t < monthEnd && t >= s.getTime())
-        ? { firstTime: t, periodMs: 30 * 86400000 }   // periodMs unused for MONTHLY loop step
-        : { firstTime: -1, periodMs: 0 };
-    }
-
-    // WEEKLY / BIWEEKLY
-    const pMs = (F === "WEEKLY" ? 7 : 14) * 86400000;
-    if (s.getTime() >= monthEnd) return { firstTime: -1, periodMs: 0 };
-
-    const base = s.getTime();
-    const startAt = Math.max(base, monthStart);
-    const k = Math.ceil((startAt - base) / pMs);
-    const first = base + k * pMs;
-
-    return (first >= monthEnd) ? { firstTime: -1, periodMs: 0 }
-                               : { firstTime: first, periodMs: pMs };
-  }
-}
-
-
-
 
 /* ============================= BANK TOTALS + CATEGORY TABLE + TOP TILES ============================= */
 function Monthly_UpdateBankAndCategoryFormatting(){
@@ -4135,18 +4055,26 @@ function SingleMonth_ClearMonthlyRows(sh){
 }
 function SingleMonth_CarryBankBegins_FromPrevEnd(sh){
   const B = CFG.bank;
-  const n = B.rowEnd - B.rowStart + 1;
+  const nameCol = _.c(B.colName);
+  const lastRow = B.rowEnd;
 
-  // Only clear totals; leave Pred Begin (L) alone
- sh.getRangeList([
-  `${B.colExpTotal}${B.rowStart}:${B.colExpTotal}${B.rowEnd}`,
-  `${B.colIncomeTotal}${B.rowStart}:${B.colIncomeTotal}${B.rowEnd}`,
-  `${B.colTransfer}${B.rowStart}:${B.colTransfer}${B.rowEnd}`,
-  `${B.colPredEnd}${B.rowStart}:${B.colPredEnd}${B.rowEnd}`,
-  `${B.colActEnd}${B.rowStart}:${B.colActEnd}${B.rowEnd}`
-]).clearContent();
+  // find last row with an account name
+  const names = sh.getRange(B.rowStart, nameCol, lastRow - B.rowStart + 1, 1).getValues();
+  let lastUsed = B.rowStart - 1;
+  for (let i = 0; i < names.length; i++){
+    if (String(names[i][0]||"").trim()) lastUsed = B.rowStart + i;
+  }
+  if (lastUsed < B.rowStart) return; // nothing to do
 
+  const firstTail = lastUsed + 1;
+  if (firstTail > lastRow) return;
+
+  // only clear totals in *tail* rows (do NOT touch Pred Begin)
+  const cols = [B.colExpTotal, B.colIncomeTotal, B.colTransfer, B.colPredEnd, B.colActEnd];
+  const a1s  = cols.map(L => `${L}${firstTail}:${L}${lastRow}`);
+  sh.getRangeList(a1s).clearContent();
 }
+
 
 /* ============================= MISC HEADER + BOUNDS ============================= */
 function Month_WriteHeader() {
@@ -4179,7 +4107,6 @@ function updateAll(){
   try {
     const totalStart = new Date();
     Logger.log("=== updateAll START ===");
-    CALL_TRACKER.updateAll++;
     console.time("updateAll");
 
 const ss = __ss();
@@ -4245,35 +4172,11 @@ function CreditCards_EnsureBankCheckboxes(){
   rng.setHorizontalAlignment("center").setVerticalAlignment("middle");
 }
 
-function _CC_computeExpenseSplits_(){
- const ss = __ss(); mSh = ss.getSheetByName(CFG.singleMonth.sheet); 
-  if(!mSh) return {chargesByAcct:new Map(), paymentsByAcct:new Map()};
-  const t = CFG.monthly.expenseTable;
-  const width = _.c(t.colAcct)-_.c(t.colName)+1;
-  const data  = mSh.getRange(t.rowStart, _.c(t.colName), t.rowEnd-t.rowStart+1, width).getValues();
-  const idxCat=_.c(t.colCat)-_.c(t.colName), idxPred=_.c(t.colPred)-_.c(t.colName), idxAct=_.c(t.colAct)-_.c(t.colName), idxAcc=_.c(t.colAcct)-_.c(t.colName);
-  const payCat = (CFG.creditCards.paymentCategory||"Credit Card Payment").toUpperCase();
-  const chargesByAcct = new Map(), paymentsByAcct = new Map();
-  for (const row of data){
-    const acct = String(row[idxAcc]||"").trim(); if(!acct) continue;
-    const cat  = String(row[idxCat]||"").trim().toUpperCase();
-    const amt  = (_.n(row[idxAct])>0)?_.n(row[idxAct]):_.n(row[idxPred]);
-    if (amt<=0) continue;
-    if (cat===payCat) paymentsByAcct.set(acct,(paymentsByAcct.get(acct)||0)+amt);
-    else              chargesByAcct.set(acct,(chargesByAcct.get(acct)||0)+amt);
-  }
-  return { chargesByAcct, paymentsByAcct };
-}
-
 function EnsureCreditCardCategory() {
   const ccCat = (CFG.creditCards && CFG.creditCards.paymentCategory) || "Credit Card Payment";
   try { Lists_AddCategory(ccCat); } catch(e) { Logger.log("CC Category error: " + e); }
 }
 
-function CreditCards_Enable(){ 
-  CreditCards_EnsureBankCheckboxes(); 
-  try{ Monthly_UpdateBankAndCategoryFormatting(); }catch(_){} 
-}
 
 
 /* ============================= ACTUALS → MONTH ============================= */
