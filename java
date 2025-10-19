@@ -27,7 +27,10 @@ var CFG = {
     colAmount: "Y",
     colToAcct: "AC"
   },
-
+  creditCards: {
+    bankMarkCol: "O",
+    paymentCategory: "Credit Card Payment"
+  },
   /* ===== DATED ACCOUNT BALANCE ===== */
 datedAccountBalance: {
   sheet: "Dated Account Balance",
@@ -76,12 +79,21 @@ datedAccountBalance: {
     colInclude: "AD"
   }
 },
+
+lists: {
+  accountsRange:      "_Lists!A2:A",
+  expenseNamesRange:  "_Lists!C2:C",
+  categoriesRange:    "_Lists!F2:F",
+  transferNamesRange: "_Lists!H2:H",
+  incomeNamesRange:   "_Lists!J2:J",
+  savingsNamesRange:  "_Lists!L2:L"
+},
   /* ===== EXPENSES ===== */
   expenses: {
     master:  { sheet:"Expenses", rowStart:12, rowEnd:148,
                colName:"I", colStart:"L", colFreq:"S", colCat:"V", colPred:"Y", colAcct:"AC" },
 
-    monthly: { rowStart:144, rowEnd:238,  // ← CHANGED from 143
+    monthly: { rowStart:144, rowEnd:400,  // ← CHANGED from 143
                colName:"I", colDate:"M", colCat:"S",
                colPred:"W", colAct:"Y", colAcct:"AC" },
 
@@ -93,8 +105,9 @@ datedAccountBalance: {
 
     categoryTiles:{
       sheet:"Expenses",
-      highestCatName:"H6", lowestCatName:"M6",
-      highestExpName:"R6", lowestExpName:"W6", totalSubs:"AB6"
+      highestExpName:"R6", lowestExpName:"W6", totalSubs:"AB6",
+      totalSpendingWithCC:"H6",  // = monthTotalNoCCPay + monthTotalCCPay
+    totalCCPayments:"M6",      // = monthTotalCCPay
     }
   },
 
@@ -214,6 +227,18 @@ datedAccountBalance: {
     }
   }
 };
+var CALL_TRACKER = {
+  updateAll: 0,
+  updateIncomeTiles: 0,
+  Expenses_UpdateSheetTiles: 0,
+  Monthly_UpdateBankAndCategoryFormatting: 0,
+  recomputeTiles: 0
+};
+// ---- Cached Spreadsheet accessor ----
+var __ssCached = null;
+function __ss() {
+  return __ssCached || (__ssCached = SpreadsheetApp.getActive());
+}
 
 /* ============================= UTILITIES ============================= */
 var _ = (function(){
@@ -290,11 +315,94 @@ function _idxOrNeg(baseCol, targetCol){
 }
 
 
+(function ensureCCcfg(){
+  if (!CFG.creditCards) {
+    CFG.creditCards = { bankMarkCol: "O", paymentCategory: "Credit Card Payment" };
+  }
+})();
+
+// Count occurrences of F in (year=y, month=m 1..12), anchored at `start`.
+// F ∈ { "ONETIME","MONTHLY","WEEKLY","BIWEEKLY" } (case-insensitive via _.normFreq)
+function _occurrencesInMonth(F, start, y, m){
+  F = _.normFreq(F);
+  if (!start) start = new Date(y,0,1);
+
+  const monthStart = new Date(y, m-1, 1).getTime();
+  const monthEnd   = new Date(y, m,   1).getTime(); // exclusive upper bound
+
+  if (F === "ONETIME") {
+    return (start.getFullYear()===y && (start.getMonth()+1)===m) ? 1 : 0;
+  }
+  if (F === "MONTHLY") {
+    // If the anchor exists before month end, we expect exactly one hit in that month.
+    return (start.getTime() < monthEnd) ? 1 : 0;
+  }
+
+  // WEEKLY / BIWEEKLY → arithmetic on the anchor; no arrays.
+  const periodDays = (F === "WEEKLY") ? 7 : 14;
+  const t0  = start.getTime();
+  const pMs = periodDays * 86400000;
+
+  if (monthEnd <= t0) return 0; // month entirely before anchor
+
+  // Find first occurrence in/after monthStart
+  const kFirst = Math.ceil((Math.max(monthStart, t0) - t0) / pMs);
+  const first  = t0 + kFirst * pMs;
+  if (first >= monthEnd) return 0;
+
+  // Last occurrence index within [t0, monthEnd)
+  const kLast = Math.floor((monthEnd - 1 - t0) / pMs);
+  return Math.max(0, kLast - kFirst + 1);
+}
+
+function _buildIsCCMap_(mSh, B, markCol){
+  const n = B.rowEnd - B.rowStart + 1;
+  const cName = _.c(B.colName), cMark = _.c(markCol);
+  const w = cMark - cName + 1;
+  const vals = mSh.getRange(B.rowStart, cName, n, w).getValues();
+  const idxMark = cMark - cName;
+  const map = new Map();
+  for (const r of vals){
+    const name = String(r[0]||"").trim();
+    if (!name) continue;
+    const v = r[idxMark];
+    const isCC = (v===true) || (v===1) || (String(v).toUpperCase()==="TRUE");
+    map.set(name, isCC);
+  }
+  return map;
+}
+const __expandCache = new Map();
+function expandMemo(y, anchor, end, F){
+  const k = y + "|" + _dateKey(anchor) + "|" + (end? _dateKey(end):"") + "|" + F;
+  const hit = __expandCache.get(k);
+  if (hit) return hit;
+  const out = _.expand(y, anchor, end, F);
+  __expandCache.set(k, out);
+  return out;
+}
+const MS_DAY = 86400000;
+function monthBounds(y, mIdx){ // mIdx: 1..12
+  const s = new Date(y, mIdx-1, 1);
+  const e = new Date(y, mIdx, 0, 23, 59, 59, 999);
+  return { s, e };
+}
+function daysInMonth(y, mIdx){ return new Date(y, mIdx, 0).getDate(); }
+
+function _effectiveRows(sh, rowStart, colIdx, rowEnd){
+  // scan the single column from bottom up to find last non-empty
+  const n = rowEnd - rowStart + 1;
+  const vals = sh.getRange(rowStart, colIdx, n, 1).getValues();
+  for (let i = n - 1; i >= 0; i--){
+    const v = String(vals[i][0] || "").trim();
+    if (v) return i + 1; // rows to read
+  }
+  return 0;
+}
 
 
 /* ============================= CATEGORY TABLE (MONTH) ============================= */
 function Expenses_UpdateCategories_INO(){
-  const ss=SpreadsheetApp.getActive(), sh=ss.getSheetByName(CFG.singleMonth.sheet); if(!sh) return;
+  const ss = __ss(); sh=ss.getSheetByName(CFG.singleMonth.sheet); if(!sh) return;
   const E=CFG.monthly.categoryTable, t=CFG.monthly.expenseTable;
 
   const width = _.c(t.colAct) - _.c(t.colCat) + 1;
@@ -335,72 +443,153 @@ for (const r of rows){
   _.fmtPct(  sh.getRange(E.rowStart, _.c(E.colPct),   Math.min(outH,sorted.length), 1));
 }
 
+function _cacheGet_(k){
+  try { return JSON.parse(CacheService.getDocumentCache().get(k) || "null"); } catch(_){ return null; }
+}
+function _cachePut_(k, obj, secs){
+  try { CacheService.getDocumentCache().put(k, JSON.stringify(obj), secs||300); } catch(_){}
+}
+function _cacheDel_(k){
+  try { CacheService.getDocumentCache().remove(k); } catch(_){}
+}
+function _toastThrottle_(key, ms){
+  const props = PropertiesService.getDocumentProperties();
+  const last = +props.getProperty(key) || 0;
+  const now  = Date.now();
+  if (now - last < ms) return false;
+  props.setProperty(key, String(now));
+  return true;
+}
+
+
 /* ============================= SMALL HELPERS ============================= */
 /* ===== DUPLICATE PREVENTION (Accounts) ===== */
 function Lists_ApplyValidations(){
-  const ss = SpreadsheetApp.getActive();
-  const lists = ss.getSheetByName("_Lists"); if (!lists) return;
+  const ss = __ss();;
+  const listsSh = ss.getSheetByName("_Lists");
+  if (!listsSh) return;
 
-  function valFromRange(a1){ 
-    const r = lists.getRange(a1);
-    return SpreadsheetApp.newDataValidation().requireValueInRange(r, true).build();
+  const mSh  = ss.getSheetByName(CFG.singleMonth.sheet);
+  const dSh  = ss.getSheetByName(CFG.datedAccountBalance.sheet);
+  if (!mSh) return;
+
+  // --- Source ranges from CFG.lists
+  const accountsSrcRng   = ss.getRange(CFG.lists.accountsRange);
+  const expenseNamesSrc  = ss.getRange(CFG.lists.expenseNamesRange);
+  const categoriesSrc    = ss.getRange(CFG.lists.categoriesRange);
+  const transferNamesSrc = ss.getRange(CFG.lists.transferNamesRange);
+  const incomeNamesSrc   = ss.getRange(CFG.lists.incomeNamesRange);
+  const savingsNamesSrc  = ss.getRange(CFG.lists.savingsNamesRange);
+
+  // Build rules
+  const ruleInAccounts = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(accountsSrcRng, true)
+      .setAllowInvalid(true)
+      .build();
+
+  const ruleInExpenseNames = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(expenseNamesSrc, true)
+      .setAllowInvalid(true)
+      .build();
+
+  const ruleInCategories = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(categoriesSrc, true)
+      .setAllowInvalid(true)
+      .build();
+
+  const ruleInTransferNames = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(transferNamesSrc, true)
+      .setAllowInvalid(true)
+      .build();
+
+  const ruleInIncomeNames = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(incomeNamesSrc, true)
+      .setAllowInvalid(true)
+      .build();
+
+  const ruleInSavingsNames = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(savingsNamesSrc, true)
+      .setAllowInvalid(true)
+      .build();
+
+  // Helper: compare + set-if-changed (keeps writes minimal)
+  function _sameValidation_(a, b){
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    if (a.getCriteriaType() !== b.getCriteriaType()) return false;
+    if (a.getAllowInvalid() !== b.getAllowInvalid()) return false;
+    // We won't deep-compare range objects (can be flaky); type+allowInvalid is sufficient to avoid thrash
+    return true;
+  }
+  function _applyValidationIfChanged_(range, rule){
+    const existing = range.getDataValidation();
+    if (_sameValidation_(existing, rule)) return;
+    range.setDataValidation(rule);
   }
 
-  const accountsVal  = valFromRange(CFG.lists.accountsRange);   // e.g. "_Lists!A2:A"
-  const categoriesVal= valFromRange(CFG.lists.categoriesRange); // e.g. "_Lists!B2:B"
-  const expNamesVal  = valFromRange(CFG.lists.expenseNamesRange);
-  const xferNamesVal = valFromRange(CFG.lists.transferNamesRange);
+  // ===== Targets =====
+  // Month — Income table
+  const IT = CFG.monthly.incomeTable;
+  const iNameR = mSh.getRange(IT.rowStart, _.c(IT.colName), IT.rowEnd-IT.rowStart+1, 1);
+  const iAcctR = mSh.getRange(IT.rowStart, _.c(IT.colAcct), IT.rowEnd-IT.rowStart+1, 1);
 
-  // Month sheet
-  (function(){
-    const sh = ss.getSheetByName(CFG.singleMonth.sheet); if (!sh) return;
-    const I = CFG.monthly.incomeTable, E = CFG.monthly.expenseTable, B = CFG.bank;
+  // Month — Expense table
+  const ET = CFG.monthly.expenseTable;
+  const eNameR = mSh.getRange(ET.rowStart, _.c(ET.colName), ET.rowEnd-ET.rowStart+1, 1);
+  const eCatR  = mSh.getRange(ET.rowStart, _.c(ET.colCat),  ET.rowEnd-ET.rowStart+1, 1);
+  const eAcctR = mSh.getRange(ET.rowStart, _.c(ET.colAcct), ET.rowEnd-ET.rowStart+1, 1);
 
-    sh.getRange(I.rowStart, _.c(I.colAcct), I.rowEnd-I.rowStart+1, 1).setDataValidation(accountsVal);
-    sh.getRange(E.rowStart, _.c(E.colAcct), E.rowEnd-E.rowStart+1, 1).setDataValidation(accountsVal);
-    sh.getRange(E.rowStart, _.c(E.colCat),  E.rowEnd-E.rowStart+1, 1).setDataValidation(categoriesVal);
-    sh.getRange(B.rowStart, _.c(B.colName), B.rowEnd-B.rowStart+1, 1).setDataValidation(accountsVal);
-    sh.getRange(E.rowStart, _.c(E.colName), E.rowEnd-E.rowStart+1, 1).setDataValidation(expNamesVal);
+  // Month — Savings (optional names validation)
+  const SM = CFG.savings.monthly;
+  const sNameR = mSh.getRange(SM.rowStart, _.c(SM.colName), SM.rowEnd-SM.rowStart+1, 1);
 
-  })();
+  // Bank table — account names
+  const B  = CFG.bank;
+  const bNameR = mSh.getRange(B.rowStart, _.c(B.colName), B.rowEnd-B.rowStart+1, 1);
 
-  // Expenses master
-  (function(){
-    const sh = ss.getSheetByName(CFG.expenses.master.sheet); if (!sh) return;
-    const M = CFG.expenses.master;
-    sh.getRange(M.rowStart, _.c(M.colName), M.rowEnd-M.rowStart+1, 1).setDataValidation(expNamesVal);
-    sh.getRange(M.rowStart, _.c(M.colAcct), M.rowEnd-M.rowStart+1, 1).setDataValidation(accountsVal);
-    sh.getRange(M.rowStart, _.c(M.colCat),  M.rowEnd-M.rowStart+1, 1).setDataValidation(categoriesVal);
-    
-  })();
+  // Dated AB (if sheet exists)
+  if (dSh) {
+    const DA = CFG.datedAccountBalance;
 
-  // Transfers sheet
-  (function(){
-    const sh = ss.getSheetByName(CFG.transfersPayments.sheet); if (!sh) return;
-    const T = CFG.transfersPayments;
-    sh.getRange(T.rowStart, _.c(T.colName),     T.rowEnd-T.rowStart+1, 1).setDataValidation(xferNamesVal);
-    sh.getRange(T.rowStart, _.c(T.colFromAcct), T.rowEnd-T.rowStart+1, 1).setDataValidation(accountsVal);
-    sh.getRange(T.rowStart, _.c(T.colToAcct),   T.rowEnd-T.rowStart+1, 1).setDataValidation(accountsVal);
-  })();
+    // Accounts table names → Accounts list
+    const daAccNameR = dSh.getRange(DA.accounts.rowStart, _.c(DA.accounts.colName), DA.accounts.rowEnd-DA.accounts.rowStart+1, 1);
 
-  (function(){
-  const sh = ss.getSheetByName(CFG.datedAccountBalance.sheet); if (!sh) return;
-  const D = CFG.datedAccountBalance;
+    // Expenses: Category → categories, Account → accounts
+    const deCatR  = dSh.getRange(DA.expenses.rowStart, _.c(DA.expenses.colCategory), DA.expenses.rowEnd-DA.expenses.rowStart+1, 1);
+    const deAcctR = dSh.getRange(DA.expenses.rowStart, _.c(DA.expenses.colAccount),  DA.expenses.rowEnd-DA.expenses.rowStart+1, 1);
 
-  // Expenses section
-  sh.getRange(D.expenses.rowStart, _.c(D.expenses.colName),     D.expenses.rowEnd - D.expenses.rowStart + 1, 1).setDataValidation(expNamesVal);
-  sh.getRange(D.expenses.rowStart, _.c(D.expenses.colCategory), D.expenses.rowEnd - D.expenses.rowStart + 1, 1).setDataValidation(categoriesVal);
-  sh.getRange(D.expenses.rowStart, _.c(D.expenses.colAccount),  D.expenses.rowEnd - D.expenses.rowStart + 1, 1).setDataValidation(accountsVal);
+    // Transfers: Name → transfer names, From/To → accounts
+    const dtNameR = dSh.getRange(DA.transfers.rowStart, _.c(DA.transfers.colName),     DA.transfers.rowEnd-DA.transfers.rowStart+1, 1);
+    const dtFromR = dSh.getRange(DA.transfers.rowStart, _.c(DA.transfers.colFromAcct), DA.transfers.rowEnd-DA.transfers.rowStart+1, 1);
+    const dtToR   = dSh.getRange(DA.transfers.rowStart, _.c(DA.transfers.colToAcct),   DA.transfers.rowEnd-DA.transfers.rowStart+1, 1);
 
-  // Transfers section
-  sh.getRange(D.transfers.rowStart, _.c(D.transfers.colName),     D.transfers.rowEnd - D.transfers.rowStart + 1, 1).setDataValidation(xferNamesVal);
-  sh.getRange(D.transfers.rowStart, _.c(D.transfers.colFromAcct), D.transfers.rowEnd - D.transfers.rowStart + 1, 1).setDataValidation(accountsVal);
-  sh.getRange(D.transfers.rowStart, _.c(D.transfers.colToAcct),   D.transfers.rowEnd - D.transfers.rowStart + 1, 1).setDataValidation(accountsVal);
+    // Income: Name → income names, Account → accounts
+    const diNameR = dSh.getRange(DA.income.rowStart, _.c(DA.income.colName), DA.income.rowEnd-DA.income.rowStart+1, 1);
+    const diAcctR = dSh.getRange(DA.income.rowStart, _.c(DA.income.colAcct), DA.income.rowEnd-DA.income.rowStart+1, 1);
 
-  // Income section
-  sh.getRange(D.income.rowStart, _.c(D.income.colAcct), D.income.rowEnd - D.income.rowStart + 1, 1).setDataValidation(accountsVal);
-})();
+    // Apply (set only if changed)
+    _applyValidationIfChanged_(daAccNameR, ruleInAccounts);
+    _applyValidationIfChanged_(deCatR,     ruleInCategories);
+    _applyValidationIfChanged_(deAcctR,    ruleInAccounts);
+    _applyValidationIfChanged_(dtNameR,    ruleInTransferNames);
+    _applyValidationIfChanged_(dtFromR,    ruleInAccounts);
+    _applyValidationIfChanged_(dtToR,      ruleInAccounts);
+    _applyValidationIfChanged_(diNameR,    ruleInIncomeNames);
+    _applyValidationIfChanged_(diAcctR,    ruleInAccounts);
+  }
+
+  // Month sheet validations
+  _applyValidationIfChanged_(iNameR, ruleInIncomeNames);
+  _applyValidationIfChanged_(iAcctR, ruleInAccounts);
+
+  _applyValidationIfChanged_(eNameR, ruleInExpenseNames);
+  _applyValidationIfChanged_(eCatR,  ruleInCategories);
+  _applyValidationIfChanged_(eAcctR, ruleInAccounts);
+
+  _applyValidationIfChanged_(sNameR, ruleInSavingsNames);
+  _applyValidationIfChanged_(bNameR, ruleInAccounts);
 }
+
 
 
 
@@ -454,7 +643,7 @@ function _preventDuplicateAccounts_(sh, rowStart, rowEnd, colName){
 }
 
 function CheckDuplicateAccounts_Auto(){
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
 
   const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
   if (mSh){
@@ -470,7 +659,7 @@ function CheckDuplicateAccounts_Auto(){
 }
 
 function ReapplyKeyFormats(){
-  const ss=SpreadsheetApp.getActive();
+  const ss = __ss();;
 
   // Month income table formats
   const mSh=ss.getSheetByName(CFG.singleMonth.sheet);
@@ -490,61 +679,18 @@ function ReapplyKeyFormats(){
     _.fmtMoney(dSh.getRange(A.rowStart, _.c(A.colPredBalance), A.rowEnd-A.rowStart+1, 1));
   }
 }
-
-function ordinal(n){ const s=["th","st","nd","rd"], v=n%100; return n + (s[(v-20)%10] || s[v] || s[0]); }
-function formatLongDate(d){
-  const wk = d.toLocaleDateString('en-US',{weekday:'long'});
-  const mo = d.toLocaleDateString('en-US',{month:'long'});
-  return `${wk}, ${mo} ${ordinal(d.getDate())}, ${d.getFullYear()}`;
-}
 function _groupWidth(i){ const g = CFG.monthly.calendar.dayColGroups[i]; return _.c(g[1]) - _.c(g[0]) + 1; }
-function _groupIndexForCol(colLtr){
-  const G = CFG.monthly.calendar.dayColGroups;
-  const x = _.c(colLtr);
-  for (let i=0;i<G.length;i++){ if (x >= _.c(G[i][0]) && x <= _.c(G[i][1])) return i; }
-  return -1;
-}
 function _ensureSheetSize(sh, minRows, minCols){
   if (sh.getMaxRows()    < minRows) sh.insertRowsAfter(sh.getMaxRows(), minRows - sh.getMaxRows());
   if (sh.getMaxColumns() < minCols) sh.insertColumnsAfter(sh.getMaxColumns(), minCols - sh.getMaxColumns());
 }
-function _panelRect(panelKey){
-  const C = CFG.monthly.calendar;
-  const p  = (panelKey==="AB") ? C.overflow1 : C.overflow2;
-  const gi = _groupIndexForCol(p.col);
-  const [cStart, cEnd] = C.dayColGroups[gi];
-  const left  = _.c(cStart);
-  const width = _.c(cEnd) - left + 1;
-return { rowStart:p.rowStart, rowEnd:p.rowEnd, left, width, headerA1: `${p.col}${p.rowStart}` };
-}
-function _centerOverflowHeader(panelKey){
-  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.singleMonth.sheet);
-  const R  = _panelRect(panelKey); // gives rowStart + full merged width
-  sh.getRange(R.rowStart, R.left, 1, R.width)
-    .setHorizontalAlignment("center")
-    .setVerticalAlignment("middle");
-}
-function centerOverflowPanels(){
-  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.singleMonth.sheet);
-  ["AB134:AE134", "AG134:AJ134"].forEach(rng => {
-    sh.getRange(rng).setHorizontalAlignment("center").setVerticalAlignment("middle");
-  });
-}
-function _outlineOverflowPanel(panelKey, on){
-  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.singleMonth.sheet);
-  const C  = CFG.monthly.calendar;
-  const R  = _panelRect(panelKey);
-  const color = C.borderColor || "#b7e1cd";
-  if (on) {
-    sh.getRange(R.rowStart, R.left, R.rowEnd - R.rowStart + 1, R.width)
-      .setBorder(true, true, true, true, false, false, color, SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
-  } else {
-    sh.getRange(R.rowStart, R.left, R.rowEnd - R.rowStart + 1, R.width).setBorder(false,false,false,false,false,false);
-  }
-  STATE.set("OV_PANEL_ACTIVE", on ? panelKey : "");
-}
-function _overflowKeyForA1(a1){ return `OV_${a1}`; }
 
+
+
+
+function _overflowKeyForA1(a1) {
+  return "CAL_OVERFLOW_" + a1;
+}
 function needsAccountPopulation(sh, tableConfig) {
   const accounts = sh.getRange(tableConfig.rowStart, _.c(tableConfig.colAcct), 
                                tableConfig.rowEnd - tableConfig.rowStart + 1, 1).getValues();
@@ -555,7 +701,7 @@ function normalizeAccountName(name) { return String(name || "").trim().toUpperCa
 
 /* ============================= LISTS + VALIDATIONS ============================= */
 function Lists_CollectAll(){
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
   const accounts = new Set();
   const expenseNames = new Set();
   const categories = new Set();
@@ -640,7 +786,7 @@ try {
 function Accounts_CollectNames(){ return Lists_CollectAll().accounts; }
 
 function _ensureListSheet(){
-  const ss = SpreadsheetApp.getActive(), name = "_Lists";
+ const ss = __ss(); name = "_Lists";
   let sh = ss.getSheetByName(name);
   if (!sh){ sh = ss.insertSheet(name); sh.hideSheet(); }
 
@@ -766,7 +912,7 @@ function _writeAccountsList(names){
 }
 
 function _mapMonthIncomeMeta_(){
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
   const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
   const map = new Map();
   if (!mSh) return map;
@@ -788,6 +934,30 @@ function _mapMonthIncomeMeta_(){
   return map;
 }
 
+// One-time memo for _.c
+// One-time memoization for _.c()
+(function(){
+  const _cache = new Map();
+  const oldC = _.c;
+  _.c = function(L){
+    if (typeof L !== "string") return oldC(L);
+    const key = L.toUpperCase();
+    if (_cache.has(key)) return _cache.get(key);
+    const v = oldC(key);
+    _cache.set(key, v);
+    return v;
+  };
+})();
+
+function _dateKey(d){
+  if (!(d instanceof Date)) d = new Date(d);
+  const y = d.getFullYear();
+  const m = d.getMonth()+1;
+  const day = d.getDate();
+  return y + "-" + (m<10?"0":"")+m + "-" + (day<10?"0":"")+day;
+}
+
+
 /* ============================= BOOL HELPERS ============================= */
 function _boolCell_(v){
   // Normalizes checkbox / TRUE/FALSE / 1/0 / Y/N to a proper boolean
@@ -797,19 +967,82 @@ function _boolCell_(v){
   return false;
 }
 
-function _val_fromRange_(rangeA1){
-  const ss = SpreadsheetApp.getActive();
-  const rng = ss.getRange(rangeA1);
-  return SpreadsheetApp.newDataValidation()
-          .requireValueInRange(rng, true)   // show dropdown
-          .setAllowInvalid(true)
-          .build();
+// Replaces a bad Spreadsheet.getRange(A1) usage.
+// Accepts either "A1" (current active sheet) or "Sheet Name!A1".
+function _val_fromRange_(a1) {
+  const ss = __ss();
+  let sh = ss.getActiveSheet();
+  let ref = String(a1 || "").trim();
+  if (!ref) return null;
+
+  // Support "Sheet Name!A1" syntax
+  const bang = ref.indexOf("!");
+  if (bang > 0) {
+    const sheetName = ref.slice(0, bang);
+    ref = ref.slice(bang + 1);
+    const s = ss.getSheetByName(sheetName);
+    if (s) sh = s;
+  }
+
+  try {
+    return sh.getRange(ref).getValue();
+  } catch (e) {
+    // As a convenience, fall back to named range if provided
+    try { return ss.getRangeByName(ref).getValue(); } catch(_) {}
+    Logger.log("_val_fromRange_ failed for: " + a1 + " → " + e);
+    return null;
+  }
+}
+
+
+function _Bank_FormatMoneyColumns_(){
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.singleMonth.sheet);
+  if (!sh) return;
+  const B = CFG.bank;
+
+  const a1s = [
+    sh.getRange(B.rowStart, _.c(B.colPredBegin),  B.rowEnd-B.rowStart+1, 1).getA1Notation(),
+    sh.getRange(B.rowStart, _.c(B.colExpTotal),   B.rowEnd-B.rowStart+1, 1).getA1Notation(),
+    sh.getRange(B.rowStart, _.c(B.colIncomeTotal),B.rowEnd-B.rowStart+1, 1).getA1Notation(),
+    sh.getRange(B.rowStart, _.c(B.colTransfer),   B.rowEnd-B.rowStart+1, 1).getA1Notation(),
+    sh.getRange(B.rowStart, _.c(B.colPredEnd),    B.rowEnd-B.rowStart+1, 1).getA1Notation(),
+    sh.getRange(B.rowStart, _.c(B.colActEnd),     B.rowEnd-B.rowStart+1, 1).getA1Notation()
+  ];
+
+  sh.getRangeList(a1s).setNumberFormat(CFG.formats.money);
+}
+
+// Return first occurrence (ms epoch) of freq within (year=y, month=m 1..12)
+// anchored at `start`. Also returns the period length in ms for iteration.
+// If there is no hit in that month, returns { firstTime: -1, periodMs: 0 }.
+function _firstOccurrenceTimeInMonth(freq, start, y, m){
+  const F = _.normFreq(freq);
+  const t0 = (start ? new Date(start) : new Date(y,0,1)).getTime();
+  const monthStart = new Date(y, m-1, 1).getTime();
+  const monthEnd   = new Date(y, m,   1).getTime(); // exclusive
+  if (F === "ONETIME"){
+    const s = start && start.getFullYear()===y && (start.getMonth()+1)===m ? start.getTime() : -1;
+    return { firstTime: s, periodMs: 0 };
+  }
+  if (F === "MONTHLY"){
+    if (t0 >= monthEnd) return { firstTime: -1, periodMs: 0 };
+    // same day-of-month as anchor, clamped to month length
+    const d = _.safeDate(y, m, (start||new Date()).getDate());
+    return { firstTime: d.getTime(), periodMs: 30*86400000 /*unused*/ };
+  }
+  // WEEKLY / BIWEEKLY
+  const pMs = (F==="WEEKLY" ? 7 : 14) * 86400000;
+  if (monthEnd <= t0) return { firstTime: -1, periodMs: 0 };
+  const kFirst = Math.ceil((Math.max(monthStart, t0) - t0) / pMs);
+  const first  = t0 + kFirst * pMs;
+  return (first >= monthEnd) ? { firstTime: -1, periodMs: 0 }
+                             : { firstTime: first, periodMs: pMs };
 }
 
 /* ===== Public list helpers ===== */
 
 function _mapMonthIncomeAcct_(){
-  const ss = SpreadsheetApp.getActive(), mSh = ss.getSheetByName(CFG.singleMonth.sheet);
+ const ss = __ss(); mSh = ss.getSheetByName(CFG.singleMonth.sheet);
   const map = new Map(); if (!mSh) return map;
   const t = CFG.monthly.incomeTable;
   const width = _.c(t.colAcct) - _.c(t.colName) + 1;
@@ -822,6 +1055,27 @@ function _mapMonthIncomeAcct_(){
   }
   return map;
 }
+
+function _inferIncomeAcct_(name){
+  try {
+    // Prefer Month Income mapping
+    if (typeof _mapMonthIncomeAcct_ === "function") {
+      const m = _mapMonthIncomeAcct_();
+      if (m && m.has(name)) return m.get(name);
+    }
+
+    // Fall back to Income Master
+    if (typeof INCOME !== "undefined" && INCOME.readMaster) {
+      const rows = INCOME.readMaster();
+      const hit = rows.find(r => String(r.name||"").trim() === String(name||"").trim() && r.acct);
+      if (hit && hit.acct) return hit.acct;
+    }
+  } catch(_) {}
+  return ""; // don’t guess
+}
+
+
+
 function DatedIncome_UpsertFromPaychecks(){
   const ss  = SpreadsheetApp.getActive();
   const dSh = ss.getSheetByName(CFG.datedAccountBalance.sheet);
@@ -883,7 +1137,7 @@ const acct = (acctMap.get(nm) || _inferIncomeAcct_(nm) || "");  // <-- fallback 
     seen.add(k);
 
     const include = existing.has(k) ? existing.get(k) : (dt <= targetDate);
-    rows.push({ nm, dt, pred, acct, include });
+rows.push({ nm, dt, pred, acct, include, freq }); // ← add freq
   }
 
   // write (clear remainder)
@@ -901,7 +1155,6 @@ out[i][oInc]  = !!r.include;
   dRng.setValues(out);
 
   // restore controls & formats
-  dSh.getRange(DI.rowStart, _.c(DI.colInclude), dN, 1).insertCheckboxes();
   _.fmtDate( dSh.getRange(DI.rowStart, _.c(DI.colDate), dN, 1) );
   _.fmtMoney(dSh.getRange(DI.rowStart, _.c(DI.colPred), dN, 1) );
 }
@@ -930,7 +1183,6 @@ function DatedIncome_RecheckIncludeForH2(){
   }
   if (touched){
     rng.setValues(data);
-    dSh.getRange(DI.rowStart, _.c(DI.colInclude), rows, 1).insertCheckboxes();
   }
 }
 
@@ -953,7 +1205,7 @@ function Lists_AddExpenseName(name){
   return true;
 }
 function _listsCollectIncomeNames_(){
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
   const set = new Set();
   try { // Income master
     const M = CFG.income.master, sh = ss.getSheetByName(M.sheet);
@@ -1050,7 +1302,7 @@ function _syncNamesIntoBlock(sh, rowStart, rowEnd, colLtr, allNames){
 }
 
 function Accounts_SyncBankBlocks(){
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
   const names = Accounts_CollectNames();
   if (!names.length) return;
 
@@ -1073,7 +1325,7 @@ function Accounts_ListRangeForValidation(){
 }
 
 function Accounts_ReapplyValidationsOnly(){
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
   const listRange = Accounts_ListRangeForValidation(); // _Lists!A2:A
 
   function apply(rng){ _applyValidationToRange_NonDestructive(rng, listRange); }
@@ -1115,7 +1367,7 @@ function Accounts_ApplyEverywhere(){ return Lists_ApplyEverywhere(); }
 
 
 function Lists_ApplyEverywhere(){
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
   const lists = Lists_CollectAll();
   const ranges = _writeAllLists(lists);
 
@@ -1187,62 +1439,12 @@ function Lists_ApplyEverywhere(){
 }
 /* ============================= CALENDAR & OVERFLOW ============================= */
 function clearOverflowPanels(){
-  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.singleMonth.sheet);
-  if (!sh) return;
-  for (const key of ["AB","AG"]){
-    const R = _panelRect(key);
-    sh.getRange(R.rowStart, R.left, R.rowEnd - R.rowStart + 1, R.width)
-      .clearContent()
-      .setBorder(false,false,false,false,false,false);
+  const props = PropertiesService.getDocumentProperties().getProperties();
+  for (const key in props) {
+    if (key.startsWith("CAL_OVERFLOW_")) {
+      PropertiesService.getDocumentProperties().deleteProperty(key);
+    }
   }
-  STATE.set("OV_PANEL_ACTIVE", "");
-}
-
-function _renderPanel(panelKey, y, m, day, items){
-  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.singleMonth.sheet);
-  if (!sh) return;
-
-  const C = CFG.monthly.calendar;
-  const panel = (panelKey === "AB") ? C.overflow1 : C.overflow2;
-  const colIdx = _.c(panel.col);
-
-  const fullDate = new Date(y, m - 1, day);
-  const header = formatLongDate(fullDate);
-
-  const R = _panelRect(panelKey);
-  const headerRange = sh.getRange(R.rowStart, R.left, 1, R.width);
-  headerRange.breakApart().merge();
-  headerRange.setValue(header);  // Remove setHorizontalAlignment
-
-  const visN = C.visibleLines || 4;
-  const hiddenItems = items.slice(visN);
-
-  const firstItemRow = panel.rowStart + 1;
-  const lastItemRow  = panel.rowEnd - 1;
-  sh.getRange(firstItemRow, colIdx, lastItemRow - firstItemRow + 1, 1).clearContent();
-
-  let r = firstItemRow, i = 0;
-  while (r <= lastItemRow && i < hiddenItems.length){
-    const it = hiddenItems[i++];
-    sh.getRange(r++, colIdx).setValue(`${it.name} ($${Number(it.amount||0).toFixed(0)})`);
-  }
-
-  const remaining = hiddenItems.length - i;
-  sh.getRange(panel.rowEnd, colIdx).setValue(remaining > 0 ? `+${remaining} more` : "");
-
-  STATE.set(panelKey === "AB" ? "OV_PANEL_AB" : "OV_PANEL_AG", JSON.stringify({ y, m, day, items }));
-  _outlineOverflowPanel(panelKey, true);
-  STATE.set(_overflowKeyForA1(R.headerA1), JSON.stringify({ y, m, day, items }));
-}
-
-function renderOverflowPanel(sh, headerA1){
-  const raw = STATE.get(_overflowKeyForA1(headerA1));
-  if (!raw) return;
-  let payload; try { payload = JSON.parse(raw); } catch(_) { return; }
-  if (!payload || !payload.items) return;
-  const C = CFG.monthly.calendar;
-const panelKey = (headerA1 === `${C.overflow1.col}${C.overflow1.rowStart}`) ? "AB" : "AG";
-  _renderPanel(panelKey, payload.y, payload.m, payload.day, payload.items);
 }
 
 /* ============================= STATE ============================= */
@@ -1257,18 +1459,23 @@ var STATE = (function(){
 })();
 
 function _expKey(nm, d, amt, acct){
-  const ds = d ? Utilities.formatDate(new Date(d), Session.getScriptTimeZone(), 'yyyy-MM-dd') : '';
-  return `E|${nm}|${ds}|${Number(amt||0).toFixed(2)}|${acct||''}`;
+  return `E|${String(nm||'').trim()}|${_dateKey(d)}|${Number(amt||0).toFixed(2)}|${String(acct||'').trim()}`;
 }
 function _xferKey(nm, d, amt, from, to){
-  const ds = d ? Utilities.formatDate(new Date(d), Session.getScriptTimeZone(), 'yyyy-MM-dd') : '';
-  return `X|${nm}|${ds}|${Number(amt||0).toFixed(2)}|${from||''}|${to||''}`;
+  return `X|${String(nm||'').trim()}|${_dateKey(d)}|${Number(amt||0).toFixed(2)}|${String(from||'').trim()}|${String(to||'').trim()}`;
 }
+function _incKey(nm, d, amt, acct){
+  const ds = d ? Utilities.formatDate(new Date(d), Session.getScriptTimeZone(), 'yyyy-MM-dd') : '';
+  return `INC|${nm||''}|${ds}|${Number(amt||0).toFixed(2)}|${acct||''}`;
+}
+
+
+
 /* ============================= EXPENSES (master → month + occurrences) ============================= */
 var EXPENSES = (function () {
   const M  = CFG.expenses.master;
   const Mm = CFG.expenses.monthly;
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
 
   function readMaster() {
     const sh = ss.getSheetByName(M.sheet); if (!sh) return [];
@@ -1319,60 +1526,94 @@ var EXPENSES = (function () {
     return out;
   }
 
-function populateMonth(sh, y, mIdx, _allowPast, masterRows) {
-  const cap = Mm.rowEnd - Mm.rowStart + 1;
+// FAST populate for Expenses Month table (no _.expand, one write)
+// FAST populate for Expenses Month table (now writes Date too)
+function populateMonth(sh, year, mIdx, allowPast, masterRows){
+  const T = CFG.expenses.monthly; if (!sh) return;
+  const cap = T.rowEnd - T.rowStart + 1;
 
-  // Read existing categories and accounts BEFORE clearing
-  const existingCats = sh.getRange(Mm.rowStart, _.c(Mm.colCat), cap, 1).getValues().map(([v])=>String(v||"").trim());
-  const existingAccts = sh.getRange(Mm.rowStart, _.c(Mm.colAcct), cap, 1).getValues().map(([v])=>String(v||"").trim());
+  // cache columns once
+  const cName = _.c(T.colName);
+  const cDate = _.c(T.colDate);
+  const cCat  = _.c(T.colCat);
+  const cPred = _.c(T.colPred);
+  const cAct  = _.c(T.colAct);
+  const cAcct = _.c(T.colAcct);
+  const width = cAcct - cName + 1;
 
-  // Clear only Name, Date, Pred (NOT Cat or Acct)
-  sh.getRange(Mm.rowStart, _.c(Mm.colName), cap, 1).clearContent();
-  sh.getRange(Mm.rowStart, _.c(Mm.colDate), cap, 1).clearContent();
-  sh.getRange(Mm.rowStart, _.c(Mm.colPred), cap, 1).clearContent();
+  const oName = 0;
+  const oDate = cDate - cName;
+  const oCat  = cCat  - cName;
+  const oPred = cPred - cName;
+  const oAct  = cAct  - cName;
+  const oAcct = cAcct - cName;
 
-  const occ = computeOccurrences(masterRows, y, mIdx);
-  const map = new Map();
-  for (const o of occ){
-    const cur = map.get(o.name);
-    if (cur){
-      cur.amt += o.amt;
-      if (o.date < cur.date) cur.date = o.date;
+  const out = Array.from({length: cap}, () => Array(width).fill(""));
+  let w = 0;
+
+  // prefilter once
+  const valid = masterRows.filter(r => {
+    const nm = String(r.name||"").trim();
+    return nm && _.n(r.amt) > 0;
+  });
+
+  const monthEnd = new Date(year, mIdx, 1).getTime(); // exclusive
+
+  for (const r of valid){
+    if (w >= cap) break;
+
+    const F     = _.normFreq(r.freq);
+    const amt   = _.n(r.amt);
+    const nm    = String(r.name||"").trim();
+    const acct  = String(r.acct||"").trim();
+    const cat   = String(r.cat||"").trim();
+    const start = r.start || new Date(year,0,1);
+
+    const { firstTime, periodMs } = _firstOccurrenceTimeInMonth(F, start, year, mIdx);
+    if (firstTime < 0) continue;
+
+    if (F === "ONETIME" || F === "MONTHLY"){
+      if (w >= cap) break;
+      out[w][oName] = nm;
+      out[w][oDate] = new Date(firstTime);
+      out[w][oCat]  = cat;
+      out[w][oPred] = amt;
+      out[w][oAct]  = "";
+      out[w][oAcct] = acct;
+      w++;
     } else {
-      map.set(o.name, { date: o.date, cat: o.cat, amt: o.amt, acct: o.acct });
+      const occ = _occurrencesInMonth(F, start, year, mIdx);
+      for (let k=0; k<occ && w<cap; k++){
+        const t = firstTime + k*periodMs;
+        if (t >= monthEnd) break;
+        out[w][oName] = nm;
+        out[w][oDate] = new Date(t);
+        out[w][oCat]  = cat;
+        out[w][oPred] = amt;
+        out[w][oAct]  = "";
+        out[w][oAcct] = acct;
+        w++;
+      }
     }
   }
-  const rows = Array.from(map.entries()).map(([name,v])=>({name, ...v}));
 
-  const n = Math.min(rows.length, cap);
-  for (let i=0; i<n; i++){
-    const r = Mm.rowStart + i, o = rows[i];
-    
-    // Always write name, date, pred
-    sh.getRange(r, _.c(Mm.colName)).setValue(o.name);
-    const d = o.date || new Date(y, mIdx-1, 1);
-    sh.getRange(r, _.c(Mm.colDate)).setValue(_.safeDate(y, mIdx, d.getDate()));
-    sh.getRange(r, _.c(Mm.colPred)).setValue(o.amt || 0);
-    
-    // Only write category if cell is EMPTY
-    if (!existingCats[i]) {
-      sh.getRange(r, _.c(Mm.colCat)).setValue(o.cat || "");
-    }
-    
-    // Only write account if cell is EMPTY
-    if (!existingAccts[i]) {
-      sh.getRange(r, _.c(Mm.colAcct)).setValue(o.acct || "");
-    }
-  }
-  
-  if (n>0){
-    _.fmtDate( sh.getRange(Mm.rowStart, _.c(Mm.colDate), n, 1));
-    _.fmtMoney(sh.getRange(Mm.rowStart, _.c(Mm.colPred), n, 1));
+  const rng = sh.getRange(T.rowStart, cName, cap, width);
+  rng.clearContent();
+  rng.setValues(out);
+
+  if (w > 0) {
+    sh.getRange(T.rowStart, cDate, w, 1).setNumberFormat(CFG.formats.date);
+    sh.getRange(T.rowStart, cPred, w, 1).setNumberFormat(CFG.formats.money);
+    sh.getRange(T.rowStart, cAct,  w, 1).setNumberFormat(CFG.formats.money);
   }
 }
 
-  return { readMaster, computeOccurrences, populateMonth };
+
+
+return { readMaster, populateMonth };
 })();
+
+
 
 /* ============================= SAVINGS ============================= */
 function getMonthlyEquivalent(freq, contrib) {
@@ -1410,7 +1651,7 @@ function Savings_GetContribForMonth(goalName, mIdx){
 function Savings_SumContribThroughMonth(goalName, throughM){ return Savings_GetContribForMonth(goalName, throughM); }
 
 function Savings_UpdateEmergencyFundTile() {
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
   const sSh = ss.getSheetByName(CFG.savings.sheet);
   if (!sSh) return;
   
@@ -1434,87 +1675,87 @@ function Savings_UpdateEmergencyFundTile() {
     .setNumberFormat(CFG.formats.money);
 }
 
-function Savings_RecomputeMonthFromMonthOnly(){
-  const ss = SpreadsheetApp.getActive();
+function Savings_RecomputeMonthFromMonthOnly() {
+  const ss = __ss();;
   const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
-  if (!mSh) return;
+  const savingsSh = ss.getSheetByName(CFG.savings.sheet);
+  if (!mSh || !savingsSh) return;
 
   const M = CFG.savings.monthly;
-  const mRows = M.rowEnd - M.rowStart + 1;
-  
-  const nameCol = mSh.getRange(M.rowStart, _.c(M.colName), mRows, 1).getValues();
-  const goalCol = mSh.getRange(M.rowStart, _.c(M.colGoal), mRows, 1).getValues();
-  const startCol = mSh.getRange(M.rowStart, _.c(M.colStart), mRows, 1).getValues();
-  const predCol = mSh.getRange(M.rowStart, _.c(M.colPred), mRows, 1).getValues();
-  const actCol = mSh.getRange(M.rowStart, _.c(M.colAct), mRows, 1).getValues();
+  const MASTER = CFG.savings.table;
+  const rows = M.rowEnd - M.rowStart + 1;
 
-  Logger.log("DEBUG Savings: First row data:");
-  Logger.log("Name: " + nameCol[0][0]);
-  Logger.log("Goal: " + goalCol[0][0]);
-  Logger.log("Start: " + startCol[0][0]);
-  Logger.log("Pred: " + predCol[0][0]);
-  Logger.log("Act: " + actCol[0][0]);
+  // Read Month block once (Name..Finish)
+  const left  = _.c(M.colName);
+  const right = _.c(M.colFinish);
+  const width = right - left + 1;
+  const data  = mSh.getRange(M.rowStart, left, rows, width).getValues();
 
-  const savingsMaster = SAVINGS.readMain();
-  const masterByName = new Map();
-  for (const s of savingsMaster) {
-    masterByName.set(s.name, s);
+  const iName = _.c(M.colName)  - left;
+  const iGoal = _.c(M.colGoal)  - left;
+  const iStart= _.c(M.colStart) - left;
+  const iPred = _.c(M.colPred)  - left;
+  const iAct  = _.c(M.colAct)   - left;
+
+  // Read master once
+  const mLeft = _.c(MASTER.colName);
+  const mRight= _.c(MASTER.colFinishDate);
+  const mWidth= mRight - mLeft + 1;
+  const master = savingsSh.getRange(MASTER.rowStart, mLeft, MASTER.rowEnd - MASTER.rowStart + 1, mWidth).getValues();
+  const mIdxStart = _.c(MASTER.colStartDate) - mLeft;
+  const mIdxFreq  = _.c(MASTER.colFreq)      - mLeft;
+
+  const masterLookup = new Map();
+  for (const r of master){
+    const name = String(r[0]||"").trim();
+    if (!name) continue;
+    masterLookup.set(name, { startDate: _.toDate(r[mIdxStart]), freq: _.normFreq(r[mIdxFreq]) });
   }
 
-  const pctOut = [];
-  const finishOut = [];
+  const outPct = Array(rows).fill(null).map(()=>[""]);
+  const outFinish = Array(rows).fill(null).map(()=>[""]);
+  const now = new Date();
 
-  for (let r = 0; r < mRows; r++){
-    const nm = String(nameCol[r][0] || "").trim();
-    
-    if (!nm) {
-      pctOut.push([""]);
-      finishOut.push([""]);
+  for (let i=0;i<rows;i++){
+    const name = String(data[i][iName]||"").trim();
+    if (!name || !masterLookup.has(name)) continue;
+
+    const goal     = _.n(data[i][iGoal]);
+    const startAmt = _.n(data[i][iStart]);
+    const monthly  = (_.n(data[i][iAct])>0) ? _.n(data[i][iAct]) : _.n(data[i][iPred]);
+    const { startDate, freq } = masterLookup.get(name);
+
+    if (!(goal>0) || !startDate) {
+      outPct[i][0] = (goal>0) ? Math.min(1, startAmt/goal) : 0;
       continue;
     }
+    // elapsed
+    const daysElapsed = Math.max(0, Math.floor((now - startDate)/86400000));
+    let totalContrib = 0;
+    if (freq === "MONTHLY")   totalContrib = monthly * Math.floor(daysElapsed/30);
+    else if (freq === "WEEKLY")   totalContrib = monthly * Math.floor(daysElapsed/7);
+    else if (freq === "BIWEEKLY") totalContrib = monthly * Math.floor(daysElapsed/14);
 
-    const goal = _.n(goalCol[r][0]);
-    const start = _.n(startCol[r][0]);
-    const pred = _.n(predCol[r][0]);
-    const act = _.n(actCol[r][0]);
-    
-    const contrib = (act > 0) ? act : pred;
-    const bal = start + contrib;
+    const currentBalance = startAmt + totalContrib;
+    outPct[i][0] = Math.min(1, goal>0 ? currentBalance/goal : 0);
 
-    if (r === 0) {
-      Logger.log("DEBUG: contrib=" + contrib + ", bal=" + bal + ", goal=" + goal);
-    }
-
-    const pct = (goal > 0) ? Math.max(0, Math.min(1, bal / goal)) : 0;
-    pctOut.push([pct]);
-
-    const remaining = Math.max(0, goal - bal);
-    
-    const master = masterByName.get(nm);
-    if (master && remaining > 0) {
-      const monthlyEq = getMonthlyEquivalent(master.freq, master.contrib);
-      if (monthlyEq > 0) {
-        const monthsToFinish = Math.ceil(remaining / monthlyEq);
-        const finish = new Date();
-        finish.setMonth(finish.getMonth() + monthsToFinish);
-        finishOut.push([finish]);
-      } else {
-        finishOut.push([""]);
-      }
-    } else {
-      finishOut.push([""]);
+    if (goal > currentBalance && monthly > 0) {
+      const remaining = goal - currentBalance;
+      const periods = Math.ceil(remaining / monthly);
+      const finish = new Date(now);
+      if (freq === "MONTHLY")      finish.setMonth(finish.getMonth() + periods);
+      else if (freq === "WEEKLY")  finish.setDate(finish.getDate() + 7*periods);
+      else if (freq === "BIWEEKLY")finish.setDate(finish.getDate() + 14*periods);
+      outFinish[i][0] = finish;
     }
   }
 
-  Logger.log("DEBUG: Writing to column Z, first value: " + pctOut[0][0]);
-
-  mSh.getRange(M.rowStart, _.c(M.colPct), mRows, 1).setValues(pctOut);
-  mSh.getRange(M.rowStart, _.c(M.colFinish), mRows, 1).setValues(finishOut);
-  
-  _.fmtPct(mSh.getRange(M.rowStart, _.c(M.colPct), mRows, 1));
-  _.fmtDate(mSh.getRange(M.rowStart, _.c(M.colFinish), mRows, 1));
-  
-  Logger.log("DEBUG: Savings percent update complete");
+  if (rows > 0){
+    mSh.getRange(M.rowStart, _.c(M.colPct), rows, 1).setValues(outPct);
+    _.fmtPct(mSh.getRange(M.rowStart, _.c(M.colPct), rows, 1));
+    mSh.getRange(M.rowStart, _.c(M.colFinish), rows, 1).setValues(outFinish);
+    _.fmtDate(mSh.getRange(M.rowStart, _.c(M.colFinish), rows, 1));
+  }
 }
 
 var SAVINGS = (function(){
@@ -1551,162 +1792,244 @@ var SAVINGS = (function(){
   }
 
 function populateMonth(sh, year, mIdx, _allowPast, mainRows){
-  const M = S.monthly;
-  const cap = M.rowEnd - M.rowStart + 1;
+  const S = CFG.savings.monthly;
+  const cap = S.rowEnd - S.rowStart + 1;
+  const width = _.c(S.colPred) - _.c(S.colName) + 1; // write through Pred in one go
+
+  const oName = 0;
+  const oGoal = _.c(S.colGoal) - _.c(S.colName);
+  const oStart= _.c(S.colStart)- _.c(S.colName);
+  const oPred = _.c(S.colPred) - _.c(S.colName);
+
+  const out = Array.from({length: cap}, () => Array(width).fill(""));
+  let w = 0;
+
+  for (const g of mainRows){
+    if (w >= cap) break;
+    const nm = String(g.name||"").trim();
+    if (!nm) continue;
+
+    const goalAmt  = _.n(g.goalAmt)  || 0;
+    const startAmt = _.n(g.startAmt) || 0;
+    const monthlyEq= getMonthlyEquivalent(g.freq, g.contrib) || 0;
+
+    out[w][oName] = nm;
+    out[w][oGoal] = goalAmt;
+    out[w][oStart]= startAmt;
+    out[w][oPred] = monthlyEq;
+    w++;
+  }
+
+  const rng = sh.getRange(S.rowStart, _.c(S.colName), cap, width);
+  rng.clearContent();
+  rng.setValues(out);
+
+  if (w > 0) {
+    sh.getRange(S.rowStart, _.c(S.colGoal),  w, 1).setNumberFormat(CFG.formats.money);
+    sh.getRange(S.rowStart, _.c(S.colStart), w, 1).setNumberFormat(CFG.formats.money);
+    sh.getRange(S.rowStart, _.c(S.colPred),  w, 1).setNumberFormat(CFG.formats.money);
+  }
+};
+
+
+function recomputeTiles(_sh, mainRows){
+  console.time("SAVINGS.recomputeTiles");
+  Logger.log("=== SAVINGS.recomputeTiles CALLED FROM: " + new Error().stack);
+  const ss = __ss();;
+  const mSh = ss.getSheetByName(CFG.singleMonth.sheet); 
+  if(!mSh) return;
+
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth() + 1;
+
+  const M = CFG.savings.monthly;
+  const rows = M.rowEnd - M.rowStart + 1;
   
-  sh.getRange(M.rowStart, _.c(M.colName),   cap, 1).clearContent();
-  sh.getRange(M.rowStart, _.c(M.colGoal),   cap, 1).clearContent();
-  sh.getRange(M.rowStart, _.c(M.colStart),  cap, 1).clearContent();
-  sh.getRange(M.rowStart, _.c(M.colPred),   cap, 1).clearContent();
-  sh.getRange(M.rowStart, _.c(M.colPct),    cap, 1).clearContent();
-  sh.getRange(M.rowStart, _.c(M.colFinish), cap, 1).clearContent();
+  // Read Month table
+  const names = mSh.getRange(M.rowStart, _.c(M.colName), rows, 1).getValues().map(([v])=>String(v||"").trim());
+  const preds = mSh.getRange(M.rowStart, _.c(M.colPred), rows, 1).getValues().map(([v])=>_.n(v));
+  const acts  = mSh.getRange(M.rowStart, _.c(M.colAct),  rows, 1).getValues().map(([v])=>_.n(v));
+  const goals = mSh.getRange(M.rowStart, _.c(M.colGoal), rows, 1).getValues().map(([v])=>_.n(v));
+  const starts = mSh.getRange(M.rowStart, _.c(M.colStart), rows, 1).getValues().map(([v])=>_.n(v));
+  const finishes = mSh.getRange(M.rowStart, _.c(M.colFinish), rows, 1).getValues().map(([v])=>_.toDate(v));
 
-  let r = 0;
-  for (const m of mainRows){
-    if (r >= cap) break;
+  let monthSave = 0;
+  let amountLeftFromCurrentBalance = 0;  // ← Changed variable name
+  let latestFinishDate = null;
+  let earliestFinishDate = null;
+  let nearestName = "";
+  let totalStartAmounts = 0;
 
-    // Calculate THIS month's predicted using calendar occurrences
-    const pred = calculateMonthlyPredicted(m.freq, m.contrib, year, mIdx, m.start);
-   // Calculate accumulated balance (start + all contributions to date)
-const monthlyEq = getMonthlyEquivalent(m.freq, m.contrib);
-const monthsSinceStart = m.start ? ((year - m.start.getFullYear()) * 12 + (mIdx - (m.start.getMonth() + 1))) : 0;
-const totalContributed = Math.max(0, monthlyEq * monthsSinceStart);
-const bal = (m.startAmt || 0) + totalContributed;
-const pct = (m.goalAmt > 0) ? Math.min(1, Math.max(0, bal / m.goalAmt)) : 0;
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    if (!name) continue;
 
-    const row = M.rowStart + r;
-    sh.getRange(row, _.c(M.colName)).setValue(m.name);
-    sh.getRange(row, _.c(M.colGoal)).setValue(m.goalAmt || 0);
-    sh.getRange(row, _.c(M.colStart)).setValue(m.startAmt || 0);
-    sh.getRange(row, _.c(M.colPred)).setValue(pred);
-    sh.getRange(row, _.c(M.colPct)).setValue(pct);
+    totalStartAmounts += starts[i];
 
-    const remaining = Math.max(0, (m.goalAmt || 0) - bal);
-    if (remaining > 0 && monthlyEq > 0){
-      const monthsToFinish = Math.ceil(remaining / monthlyEq);
-      const finish = new Date(year, mIdx - 1, 1);
-      finish.setMonth(finish.getMonth() + monthsToFinish);
-      sh.getRange(row, _.c(M.colFinish)).setValue(finish);
+    // Month contribution (from Month table, actual first then pred)
+    const contrib = acts[i] > 0 ? acts[i] : preds[i];
+    monthSave += contrib;
+
+    // Current balance = start + this month's contribution
+    const currentBalance = starts[i] + contrib;
+    
+    // Amount left = Goal - CurrentBalance
+    const remainingFromCurrentBalance = Math.max(0, goals[i] - currentBalance);
+    amountLeftFromCurrentBalance += remainingFromCurrentBalance;
+
+    // Track finish dates from Month table
+    const finishDate = finishes[i];
+    if (finishDate) {
+      if (!latestFinishDate || finishDate > latestFinishDate) {
+        latestFinishDate = finishDate;
+      }
+      if (!earliestFinishDate || finishDate < earliestFinishDate) {
+        earliestFinishDate = finishDate;
+        nearestName = name;
+      }
     }
-    r++;
   }
 
-  if (r > 0){
-    _.fmtMoney(sh.getRange(M.rowStart, _.c(M.colGoal),   r, 1));
-    _.fmtMoney(sh.getRange(M.rowStart, _.c(M.colStart),  r, 1));
-    _.fmtMoney(sh.getRange(M.rowStart, _.c(M.colPred),   r, 1));
-    _.fmtPct(  sh.getRange(M.rowStart, _.c(M.colPct),    r, 1));
-    _.fmtDate( sh.getRange(M.rowStart, _.c(M.colFinish), r, 1));
+  // Calculate months left from latest finish date
+  let monthsLeft = 0;
+  if (latestFinishDate) {
+    const diffTime = latestFinishDate - now;
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    monthsLeft = Math.max(0, Math.ceil(diffDays / 30));
   }
-}
 
-  function recomputeTiles(_sh, mainRows){
-    const mSh = ss.getSheetByName(CFG.singleMonth.sheet); if(!mSh) return;
+  const MT = CFG.savings.monthlyTiles;
+  const sSh = ss.getSheetByName(CFG.savings.sheet);
 
-    const now = new Date();
-    const y = now.getFullYear();
-    const m = now.getMonth() + 1;
+  // Month tiles (H6, M6, R6, W6, AB6)
+  _.fmtMoney(mSh.getRange(MT.totalSaved)).setValue(monthSave);                          // H6 = this month's contributions
+  _.fmtMoney(mSh.getRange(MT.amountLeft)).setValue(amountLeftFromCurrentBalance);       // M6 = Goal - (Start + ThisMonthContrib)
+  mSh.getRange(MT.monthsLeft).setValue(monthsLeft).setNumberFormat(CFG.formats.months1); // R6 = months to latest finish
+  mSh.getRange(MT.nearestGoal).setValue(nearestName);                                   // W6 = nearest goal name
 
-    const M = CFG.savings.monthly;
-    const rows = M.rowEnd - M.rowStart + 1;
-    const names = mSh.getRange(M.rowStart, _.c(M.colName), rows, 1).getValues().map(([v])=>String(v||"").trim());
-    const preds = mSh.getRange(M.rowStart, _.c(M.colPred), rows, 1).getValues().map(([v])=>_.n(v));
-    const acts  = mSh.getRange(M.rowStart, _.c(M.colAct),  rows, 1).getValues().map(([v])=>_.n(v));
+  const incomeAEP = _.sumAEP_block(
+    mSh, CFG.monthly.incomeTable.rowStart, CFG.monthly.incomeTable.rowEnd,
+    CFG.monthly.incomeTable.colPred, CFG.monthly.incomeTable.colAct
+  );
+  mSh.getRange(MT.savingsToIncome)
+     .setValue(incomeAEP > 0 ? monthSave / incomeAEP : 0)
+     .setNumberFormat(CFG.formats.percent1);  // AB6 = savings to income ratio
 
-    let monthSave=0, amountLeft=0, longest=0, nearest=1e9, nearestName="", totalStartAmounts=0;
+  // Savings sheet tiles (H2, M2, R2, W2) - these still look at Savings sheet calculations
+  if (sSh) {
+    let savingsSheetTotal = 0;
+    let savingsSheetLeft = 0;
+    let savingsSheetLongest = 0;
+    let savingsSheetNearest = 1e9;
+    let savingsSheetNearestName = "";
 
-    for (const goal of mainRows){
-      totalStartAmounts += (goal.startAmt || 0);
+    for (const goal of mainRows) {
+      savingsSheetTotal += (goal.startAmt || 0);
 
-      let contrib = 0;
-      const i = names.indexOf(goal.name);
-      if (i>=0) contrib = (acts[i]>0 ? acts[i] : preds[i]);
-      else      contrib = calculateMonthlyPredicted(goal.freq, goal.contrib, y, m, goal.start);
-
-      monthSave += contrib;
-
-      const currentBalance = (goal.startAmt || 0) + contrib;
-      const rem = Math.max(0, (goal.goalAmt || 0) - currentBalance);
-      amountLeft += rem;
+      const remainingFromStart = Math.max(0, (goal.goalAmt || 0) - (goal.startAmt || 0));
+      savingsSheetLeft += remainingFromStart;
 
       const monthlyEq = getMonthlyEquivalent(goal.freq, goal.contrib);
-      if (monthlyEq > 0 && rem > 0){
-        const monthsLeft = Math.ceil(rem / monthlyEq);
-        longest = Math.max(longest, monthsLeft);
-        if (monthsLeft < nearest){ nearest = monthsLeft; nearestName = goal.name; }
+      if (monthlyEq > 0 && remainingFromStart > 0) {
+        const monthsLeft = Math.ceil(remainingFromStart / monthlyEq);
+        savingsSheetLongest = Math.max(savingsSheetLongest, monthsLeft);
+        if (monthsLeft < savingsSheetNearest) {
+          savingsSheetNearest = monthsLeft;
+          savingsSheetNearestName = goal.name;
+        }
       }
     }
 
-    const MT = CFG.savings.monthlyTiles;
-    const sSh = ss.getSheetByName(CFG.savings.sheet);
-
-    _.fmtMoney(mSh.getRange(MT.totalSaved)).setValue(monthSave);
-    _.fmtMoney(mSh.getRange(MT.amountLeft)).setValue(amountLeft);
-    mSh.getRange(MT.monthsLeft).setValue(longest).setNumberFormat(CFG.formats.months1);
-    mSh.getRange(MT.nearestGoal).setValue(nearestName);
-
-    const incomeAEP = _.sumAEP_block(
-      mSh, CFG.monthly.incomeTable.rowStart, CFG.monthly.incomeTable.rowEnd,
-      CFG.monthly.incomeTable.colPred, CFG.monthly.incomeTable.colAct
-    );
-    mSh.getRange(MT.savingsToIncome)
-       .setValue(incomeAEP>0 ? monthSave/incomeAEP : 0)
-       .setNumberFormat(CFG.formats.percent1);
-
-    _.fmtMoney(sSh.getRange(CFG.savings.tiles.totalSaved)).setValue(totalStartAmounts);
-    _.fmtMoney(sSh.getRange(CFG.savings.tiles.amountLeft)).setValue(amountLeft);
-    sSh.getRange(CFG.savings.tiles.monthsLeft).setValue(longest).setNumberFormat(CFG.formats.months1);
-    sSh.getRange(CFG.savings.tiles.nearestToComplete).setValue(nearestName);
+    _.fmtMoney(sSh.getRange(CFG.savings.tiles.totalSaved)).setValue(savingsSheetTotal);
+    _.fmtMoney(sSh.getRange(CFG.savings.tiles.amountLeft)).setValue(savingsSheetLeft);
+    sSh.getRange(CFG.savings.tiles.monthsLeft).setValue(savingsSheetLongest).setNumberFormat(CFG.formats.months1);
+    sSh.getRange(CFG.savings.tiles.nearestToComplete).setValue(savingsSheetNearestName);
   }
-  function recomputeMain(mainSh, mainRows){
-  const T = S.table;
-  const names = mainSh.getRange(T.rowStart, _.c(T.colName), T.rowEnd - T.rowStart + 1, 1).getValues().map(r => String(r[0] || "").trim());
-  
-  // Get Month savings actuals to calculate real progress
-  const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
-  const M = CFG.savings.monthly;
-  const monthNames = mSh ? mSh.getRange(M.rowStart, _.c(M.colName), M.rowEnd - M.rowStart + 1, 1).getValues().map(r => String(r[0] || "").trim()) : [];
-  const monthPreds = mSh ? mSh.getRange(M.rowStart, _.c(M.colPred), M.rowEnd - M.rowStart + 1, 1).getValues().map(r => _.n(r[0])) : [];
-  const monthActs  = mSh ? mSh.getRange(M.rowStart, _.c(M.colAct),  M.rowEnd - M.rowStart + 1, 1).getValues().map(r => _.n(r[0])) : [];
+    console.timeEnd("SAVINGS.recomputeTiles");
 
-  for (const m of mainRows){
-    const i = names.indexOf(m.name);
-    if (i < 0) continue;
-
-    // Get this month's contribution (Actual if exists, else Pred)
-    let monthContrib = 0;
-    const mi = monthNames.indexOf(m.name);
-    if (mi >= 0) {
-      monthContrib = (monthActs[mi] > 0) ? monthActs[mi] : monthPreds[mi];
-    } else {
-      // Calculate from master if not in month table
-      const y = _.year();
-      const mIdx = _.monthIdx();
-      monthContrib = calculateMonthlyPredicted(m.freq, m.contrib, y, mIdx, m.start);
-    }
-
-    const bal = (m.startAmt || 0) + monthContrib;
-    const pct = (m.goalAmt > 0) ? Math.min(1, Math.max(0, bal / m.goalAmt)) : 0;
-    mainSh.getRange(T.rowStart + i, _.c(T.colPct)).setValue(pct);
-
-    const remaining = Math.max(0, (m.goalAmt || 0) - bal);
-    const monthlyEq = getMonthlyEquivalent(m.freq, m.contrib);
-    if (remaining > 0 && monthlyEq > 0){
-      const monthsToFinish = Math.ceil(remaining / monthlyEq);
-      const finish = new Date();
-      finish.setMonth(finish.getMonth() + monthsToFinish);
-      mainSh.getRange(T.rowStart + i, _.c(T.colFinishDate)).setValue(finish);
-    } else {
-      mainSh.getRange(T.rowStart + i, _.c(T.colFinishDate)).clearContent();
-    }
-  }
-
-  _.fmtPct(  mainSh.getRange(T.rowStart, _.c(T.colPct),        T.rowEnd - T.rowStart + 1, 1));
-  _.fmtDate( mainSh.getRange(T.rowStart, _.c(T.colFinishDate), T.rowEnd - T.rowStart + 1, 1));
-  
-  recomputeTiles(mainSh, mainRows);
 }
+function recomputeMain(mainSh, mainRows){
+  const T = CFG.savings.table;
+  const n = mainRows.length;
+  if (n === 0) return;
 
+  const outPct = [];
+  const outFinish = [];
+
+  const now = new Date();
+
+  for (const r of mainRows) {
+    const goal = _.n(r.goalAmt);
+    const start = _.n(r.startAmt);
+    const contribPerPeriod = _.n(r.contrib);
+    const freq = _.normFreq(r.freq);
+    const startDate = r.start || new Date();
+    
+    // Calculate days elapsed from start date
+    const daysElapsed = Math.max(0, Math.floor((now - startDate) / (1000 * 60 * 60 * 24)));
+    
+    // Calculate total contributions based on frequency
+    let totalContributions = 0;
+    if (freq === "MONTHLY") {
+      const monthsElapsed = Math.floor(daysElapsed / 30);
+      totalContributions = contribPerPeriod * monthsElapsed;
+    } else if (freq === "WEEKLY") {
+      const weeksElapsed = Math.floor(daysElapsed / 7);
+      totalContributions = contribPerPeriod * weeksElapsed;
+    } else if (freq === "BIWEEKLY") {
+      const biweeksElapsed = Math.floor(daysElapsed / 14);
+      totalContributions = contribPerPeriod * biweeksElapsed;
+    }
+    
+    const currentBalance = start + totalContributions;
+    const pct = (goal > 0) ? Math.max(0, Math.min(1, currentBalance / goal)) : 0;
+    
+    outPct.push([pct]);
+    
+    // Calculate finish date
+    if (goal > currentBalance && contribPerPeriod > 0) {
+      const remaining = goal - currentBalance;
+      let periodsNeeded = 0;
+      
+      if (freq === "MONTHLY") {
+        periodsNeeded = Math.ceil(remaining / contribPerPeriod);
+        const finish = new Date(now);
+        finish.setMonth(finish.getMonth() + periodsNeeded);
+        outFinish.push([finish]);
+      } else if (freq === "WEEKLY") {
+        periodsNeeded = Math.ceil(remaining / contribPerPeriod);
+        const finish = new Date(now);
+        finish.setDate(finish.getDate() + (periodsNeeded * 7));
+        outFinish.push([finish]);
+      } else if (freq === "BIWEEKLY") {
+        periodsNeeded = Math.ceil(remaining / contribPerPeriod);
+        const finish = new Date(now);
+        finish.setDate(finish.getDate() + (periodsNeeded * 14));
+        outFinish.push([finish]);
+      } else {
+        outFinish.push([""]);
+      }
+    } else {
+      outFinish.push([""]);
+    }
+  }
+
+  if (n > 0) {
+    const pctCol = _.c(T.colPct);
+    const finishCol = _.c(T.colFinishDate);
+    
+    if (pctCol > 0) {
+      mainSh.getRange(T.rowStart, pctCol, n, 1).setValues(outPct);
+      _.fmtPct(mainSh.getRange(T.rowStart, pctCol, n, 1));
+    }
+    
+    if (finishCol > 0) {
+      mainSh.getRange(T.rowStart, finishCol, n, 1).setValues(outFinish);
+      _.fmtDate(mainSh.getRange(T.rowStart, finishCol, n, 1));
+    }
+  }
+}
 return { readMain, populateMonth, recomputeMain, recomputeTiles };
 
 })();
@@ -1749,68 +2072,104 @@ var INCOME = (function(){
     return rows;
   }
 
-  function computePlan(rows, year, m){
-    const out = [];
-    for (const r of rows){
-      if (!_.inWindowMonth(r.start, null, year, m)) continue;
-      const F = _.normFreq(r.freq);
-
-      if (F === "ONETIME"){
-        if (r.start && r.start.getFullYear()===year && (r.start.getMonth()+1)===m){
-          out.push({ name:r.name, annual:r.annual, monthly:r.perFreq, acct:r.acct || "" });
-        }
-      } else {
-        const occs = _.expand(year, r.start || new Date(year,0,1), null, F);
-        const monthOccs = occs.filter(d => (d.getMonth()+1) === m);
-        if (monthOccs.length > 0){
-          out.push({ name:r.name, annual:r.annual, monthly: r.perFreq * monthOccs.length, acct:r.acct || "" });
-        }
+function computePlan(rows, year, m){
+  const out = [];
+  for (const r of rows){
+    const F = _.normFreq(r.freq);
+    if (!_.inWindowMonth(r.start, null, year, m) && F!=="ONETIME") {
+      // keep your original gating if you rely on inWindowMonth;
+      // MONTHLY/WEEKLY/BIWEEKLY still handled by the counter below
+    }
+    const occ = _occurrencesInMonth(F, r.start || new Date(year,0,1), year, m);
+    if (F === "ONETIME") {
+      if (occ === 1){
+        out.push({ name:r.name, annual:r.annual, monthly:r.perFreq, acct:r.acct || "" });
       }
-    }
-    return out;
-  }
-
-  function populateMonth(sh, y, mIdx, _allowPast, masterRows){
-    const plan = computePlan(masterRows, y, mIdx);
-    const rows = Mm.rowEnd - Mm.rowStart + 1;
-
-    const populateAccounts = needsAccountPopulation(sh, Mm);
-
-    sh.getRange(Mm.rowStart, _.c(Mm.colName),        rows, 1).clearContent();
-    sh.getRange(Mm.rowStart, _.c(Mm.colPredAnnual),  rows, 1).clearContent();
-    sh.getRange(Mm.rowStart, _.c(Mm.colPredMonthly), rows, 1).clearContent();
-
-    const n = Math.min(plan.length, rows);
-    for (let i=0; i<n; i++){
-      const p = plan[i], r = Mm.rowStart + i;
-      sh.getRange(r, _.c(Mm.colName)).setValue(p.name);
-      sh.getRange(r, _.c(Mm.colPredAnnual)).setValue(p.annual || 0);
-      sh.getRange(r, _.c(Mm.colPredMonthly)).setValue(p.monthly || 0);
-      if (populateAccounts){ sh.getRange(r, _.c(Mm.colAcct)).setValue(p.acct || ""); }
-    }
-    if (n > 0){
-      _.fmtMoney(sh.getRange(Mm.rowStart, _.c(Mm.colPredAnnual),  n, 1));
-      _.fmtMoney(sh.getRange(Mm.rowStart, _.c(Mm.colPredMonthly), n, 1));
+    } else if (occ > 0){
+      out.push({ name:r.name, annual:r.annual, monthly: r.perFreq * occ, acct:r.acct || "" });
     }
   }
+  return out;
+}
 
-  return { readMaster, computePlan, populateMonth };
-})();
 
+function populateMonth(sh, year, mIdx, allowPast, masterRows) {
+  const M = CFG.monthly.incomeTable;
+  const cap = M.rowEnd - M.rowStart + 1;
+
+  // cache columns once
+  const cName = _.c(M.colName);
+  const cPred = _.c(M.colPred);
+  const cAcct = _.c(M.colAcct);
+  const width = cAcct - cName + 1;
+
+  const oName = 0;
+  const oPred = cPred - cName;
+  const oAcct = cAcct - cName;
+
+  const out = Array.from({length: cap}, () => Array(width).fill(""));
+  let w = 0;
+
+  // (optional) prefilter by name existence
+  const valid = masterRows.filter(inc => String(inc.name||"").trim());
+
+  for (const inc of valid){
+    if (w >= cap) break;
+    const nm = String(inc.name||"").trim();
+
+    const occ = _occurrencesInMonth(inc.freq, inc.start || new Date(year,0,1), year, mIdx);
+    const monthlyAmt = (inc.perFreq || 0) * occ;
+
+    out[w][oName] = nm;
+    out[w][oPred] = monthlyAmt;
+    out[w][oAcct] = String(inc.acct||"").trim();
+    w++;
+  }
+
+  const rng = sh.getRange(M.rowStart, cName, cap, width);
+  rng.clearContent();
+  rng.setValues(out);
+
+  if (w > 0) {
+    sh.getRange(M.rowStart, cPred, w, 1).setNumberFormat(CFG.formats.money);
+  }
+}
+
+
+return { readMaster, computePlan, populateMonth };
+})();  // ← closes var INCOME = (function(){ ... })();
 /* ============================= TRANSFERS (expand by frequency) ============================= */
 var TRANSFERS = (function(){
   const TP = CFG.transfersPayments, ss = SpreadsheetApp.getActive();
+
   function readAndExpandForMonth(y, m){
+    const CK = `xfer:${y}:${m}`;
+const hit = _cacheGet_(CK);
+if (hit) return hit;
+
     const sh = ss.getSheetByName(TP.sheet); if (!sh) return [];
     const rows  = TP.rowEnd - TP.rowStart + 1;
-    const width = _.c(TP.colToAcct) - _.c(TP.colName) + 1;
-    const data  = sh.getRange(TP.rowStart, _.c(TP.colName), rows, width).getValues();
-    const idx   = L => _.c(L) - _.c(TP.colName);
+
+    // cache columns once
+    const cName = _.c(TP.colName);
+    const cDate = _.c(TP.colDate);
+    const cFreq = _.c(TP.colFreq);
+    const cFrom = _.c(TP.colFromAcct);
+    const cTo   = _.c(TP.colToAcct);
+    const cAmt  = _.c(TP.colAmount);
+    const width = cTo - cName + 1;
+
+    const data  = sh.getRange(TP.rowStart, cName, rows, width).getValues();
+    const idx = L => _.c(L) - cName;
+
     const out = [];
-    
-    for (const r of data){
-  
-      const name   = String(r[0]||"").trim(); if (!name) continue;
+    const monthEnd = new Date(y, m, 1).getTime(); // m = 1..12 → JS month next month (exclusive)
+
+    // prefilter once
+    const valid = data.filter(r => String(r[0]||"").trim() !== "");
+
+    for (const r of valid){
+      const name   = String(r[0]||"").trim();
       const start  = _.toDate(r[idx(TP.colDate)]); if (!start) continue;
       const freq   = _.normFreq(r[idx(TP.colFreq)]);
       const from   = String(r[idx(TP.colFromAcct)]||"").trim();
@@ -1818,25 +2177,45 @@ var TRANSFERS = (function(){
       const amount = _.n(r[idx(TP.colAmount)]);
       if (!from || !to || amount<=0) continue;
 
-      const dates = (freq==="ONETIME")
-        ? ((start.getFullYear()===y && (start.getMonth()+1)===m) ? [start] : [])
-        : _.expand(y, start, null, freq).filter(d => (d.getMonth()+1)===m);
+      const { firstTime, periodMs } = _firstOccurrenceTimeInMonth(freq, start, y, m);
+      if (firstTime < 0) continue;
 
-      for (const d of dates){ out.push({ name, date:d, from, to, amount, freq }); }
+      if (freq === "ONETIME" || freq === "MONTHLY"){
+        out.push({ name, date: new Date(firstTime), from, to, amount, freq });
+      } else {
+        const occ = _occurrencesInMonth(freq, start, y, m);
+        for (let k=0; k<occ; k++){
+          const t = firstTime + k*periodMs;
+          if (t >= monthEnd) break;
+          out.push({ name, date:new Date(t), from, to, amount, freq });
+        }
+      }
     }
-    return out;
+_cachePut_(CK, out, 180); // 3 minutes
+return out;
   }
   return { readAndExpandForMonth };
 })();
 
+
 /* ============================= PAYCHECKS ============================= */
 /* ============================= PAYCHECKS (full-year, Pred only) ============================= */
 var PAYCHECKS = (function(){
-  const P = CFG.income.paychecks, ss = SpreadsheetApp.getActive();
+  const P = CFG.income.paychecks;
+  const ss = __ss();
 
   function rebuild(){
-    const sh = ss.getSheetByName(P.sheet); if (!sh) return;
+    const ck = "paychecks:" + (new Date()).getFullYear();
+    try {
+      const hit = CacheService.getDocumentCache().get(ck);
+      if (hit) {
+        const rows = JSON.parse(hit);
+        _writeRows(rows); // helper: does the writing/formatting
+        return;
+      }
+    } catch(_) {}
 
+    const sh = ss.getSheetByName(P.sheet); if (!sh) return;
     const yr = (new Date()).getFullYear();
     const master = (typeof INCOME!=='undefined' && INCOME.readMaster) ? INCOME.readMaster() : [];
     const rows = [];
@@ -1850,94 +2229,348 @@ var PAYCHECKS = (function(){
         continue;
       }
       const anchor = r.start || new Date(yr,0,1);
-      const dates  = _.expand(yr, anchor, null, F);
+      const dates  = expandMemo(yr, anchor, null, F);
       const label  = (F==="WEEKLY")?"Weekly":(F==="BIWEEKLY"?"Bi-weekly":"Monthly");
       for (const d of dates){ rows.push({ name:r.name, date:d, freq:label, amount:r.perFreq||0 }); }
     }
 
     rows.sort((a,b)=>a.date-b.date);
+    _writeRows(rows);
 
-    const cap = P.rowEnd - P.rowStart + 1;
-    // Clear only what we own (Name/Date/Freq/Pred). We do NOT touch Act.
-    for (const col of [P.colName, P.colDate, P.colFreq, P.colPred]){
-      sh.getRange(P.rowStart, _.c(col), cap, 1).clearContent();
-    }
-
-    const n = Math.min(rows.length, cap);
-    if (n===0) return;
-
-    sh.getRange(P.rowStart, _.c(P.colName), n, 1).setValues(rows.slice(0,n).map(r=>[r.name]));
-    sh.getRange(P.rowStart, _.c(P.colDate), n, 1).setValues(rows.slice(0,n).map(r=>[r.date]));
-    sh.getRange(P.rowStart, _.c(P.colFreq), n, 1).setValues(rows.slice(0,n).map(r=>[r.freq]));
-    sh.getRange(P.rowStart, _.c(P.colPred), n, 1).setValues(rows.slice(0,n).map(r=>[r.amount]));
-
-    _.fmtDate( sh.getRange(P.rowStart, _.c(P.colDate), n, 1));
-    _.fmtMoney(sh.getRange(P.rowStart, _.c(P.colPred), n, 1));
+    try { CacheService.getDocumentCache().put(ck, JSON.stringify(rows), 180); } catch(_){}
   }
+
+  function _writeRows(rows){
+    const sh = ss.getSheetByName(P.sheet); if (!sh) return;
+    const cap = P.rowEnd - P.rowStart + 1;
+    const n = Math.min(rows.length, cap);
+    const cName = _.c(P.colName), cDate = _.c(P.colDate), cFreq = _.c(P.colFreq), cPred = _.c(P.colPred);
+
+    sh.getRangeList([
+      `${colLetter(P.colName)}${P.rowStart}:${colLetter(P.colName)}${P.rowEnd}`,
+      `${colLetter(P.colDate)}${P.rowStart}:${colLetter(P.colDate)}${P.rowEnd}`,
+      `${colLetter(P.colFreq)}${P.rowStart}:${colLetter(P.colFreq)}${P.rowEnd}`,
+      `${colLetter(P.colPred)}${P.rowStart}:${colLetter(P.colPred)}${P.rowEnd}`
+    ]).clearContent();
+
+    if (n===0) return;
+    sh.getRange(P.rowStart, cName, n, 1).setValues(rows.slice(0,n).map(r=>[r.name]));
+    sh.getRange(P.rowStart, cDate, n, 1).setValues(rows.slice(0,n).map(r=>[r.date]));
+    sh.getRange(P.rowStart, cFreq, n, 1).setValues(rows.slice(0,n).map(r=>[r.freq]));
+    sh.getRange(P.rowStart, cPred, n, 1).setValues(rows.slice(0,n).map(r=>[r.amount]));
+    _.fmtDate( sh.getRange(P.rowStart, cDate, n, 1));
+    _.fmtMoney(sh.getRange(P.rowStart, cPred, n, 1));
+  }
+
   return { rebuild };
 })();
+
 
 
 /* ============================= DATED ACCOUNT BALANCE (FIXED) ============================= */
 var DATED_ACCOUNT_BALANCE = (function(){
   const D  = CFG.datedAccountBalance;
   const TP = CFG.transfersPayments;
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
 
-  function updateDatedAccountBalance(){
-    const sh = ss.getSheetByName(D.sheet); if (!sh) return;
-    const targetDate = _.toDate(sh.getRange(D.targetDate).getValue());
-    if (!targetDate) return;
+function updateDatedAccountBalance(){
+  const startTime = new Date();
+  Logger.log("=== updateDatedAccountBalance START ===");
 
-    // Accounts & start balances
-    const aRows = D.accounts.rowEnd - D.accounts.rowStart + 1;
-    const names = sh.getRange(D.accounts.rowStart, _.c(D.accounts.colName), aRows, 1).getValues().map(r=>String(r[0]||"").trim());
-    const starts= sh.getRange(D.accounts.rowStart, _.c(D.accounts.colStartBalance), aRows, 1).getValues().map(r=>_.n(r[0]));
-    
-    const map = new Map();
-    for (let i=0;i<names.length;i++){ if (names[i]) map.set(names[i], { start:starts[i]||0, inc:0, exp:0, xfer:0 }); }
+  const ss = __ss();
+  const sh = ss.getSheetByName(CFG.datedAccountBalance.sheet);
+  const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
+  if (!sh) return;
 
-    _sumExpenses(sh, targetDate, map);
-_sumTransfers(sh, targetDate, map);
-_sumIncomeToDate(sh, targetDate, map);
+  const D = CFG.datedAccountBalance;
 
-    const outInc=[], outExp=[], outXf=[], outEnd=[];
-    for (const nm of names){
-      if (!nm){ outInc.push([""]); outExp.push([""]); outXf.push([""]); outEnd.push([""]); continue; }
-      const v = map.get(nm) || {start:0,inc:0,exp:0,xfer:0};
-      const endBal = v.start + v.inc - v.exp + v.xfer;
-      outInc.push([v.inc]); 
-      outExp.push([v.exp]); 
-      outXf.push([v.xfer]);
-      outEnd.push([endBal]);
-    }
-    
-    sh.getRange(D.accounts.rowStart, _.c(D.accounts.colIncome),     aRows, 1).setValues(outInc);
-    sh.getRange(D.accounts.rowStart, _.c(D.accounts.colExpense),    aRows, 1).setValues(outExp);
-    sh.getRange(D.accounts.rowStart, _.c(D.accounts.colTransfers),  aRows, 1).setValues(outXf);
-    sh.getRange(D.accounts.rowStart, _.c(D.accounts.colPredBalance),aRows, 1).setValues(outEnd);
+  // Build isCC map once
+  const isCC = _buildIsCCMap_(mSh, CFG.bank, (CFG.creditCards && CFG.creditCards.bankMarkCol) || "O");
 
-    _.fmtMoney(sh.getRange(D.accounts.rowStart, _.c(D.accounts.colIncome),     aRows, 1));
-    _.fmtMoney(sh.getRange(D.accounts.rowStart, _.c(D.accounts.colExpense),    aRows, 1));
-    _.fmtMoney(sh.getRange(D.accounts.rowStart, _.c(D.accounts.colTransfers),  aRows, 1));
-    _.fmtMoney(sh.getRange(D.accounts.rowStart, _.c(D.accounts.colPredBalance),aRows, 1));
+  // Target date
+  const targetDate = _.toDate(sh.getRange(D.targetDate).getValue());
+  if (!targetDate) return;
+
+  // ---------- Read account names + starts (gap-safe) ----------
+  console.time("Read accounts");
+  const aNameCol = _.c(D.accounts.colName);
+  const aStartCol = _.c(D.accounts.colStartBalance);
+  const aRowsCfg = D.accounts.rowEnd - D.accounts.rowStart + 1;
+  const aRowsEff = _effectiveRows(sh, D.accounts.rowStart, aNameCol, D.accounts.rowEnd); // count non-blank names
+  const aRowsUse = Math.max(aRowsEff, 0);
+
+  const names  = (aRowsUse > 0)
+    ? sh.getRange(D.accounts.rowStart, aNameCol, aRowsUse, 1).getValues().map(r => String(r[0] || "").trim())
+    : [];
+  const starts = (aRowsUse > 0)
+    ? sh.getRange(D.accounts.rowStart, aStartCol, aRowsUse, 1).getValues().map(r => _.n(r[0]))
+    : [];
+  console.timeEnd("Read accounts");
+
+  // Working map by account
+  const map = new Map();
+  for (let i = 0; i < names.length; i++){
+    const nm = names[i];
+    if (nm) map.set(nm, { start: starts[i] || 0, inc: 0, exp: 0, xfer: 0 });
   }
 
+  // ---------- Rollups ----------
+  console.time("_sumExpenses");
+  _sumExpenses(sh, targetDate, map);
+  console.timeEnd("_sumExpenses");
+
+  console.time("_sumTransfers");
+  _sumTransfers(sh, targetDate, map, isCC);
+  console.timeEnd("_sumTransfers");
+
+  console.time("_sumIncomeToDate");
+  _sumIncomeToDate(sh, targetDate, map);
+  console.timeEnd("_sumIncomeToDate");
+
+  // ---------- Build outputs ----------
+  console.time("Write results");
+  const outInc = [];
+  const outExp = [];
+  const outXf  = [];
+  const outEnd = [];
+
+  for (const nm of names){
+    if (!nm){ outInc.push([""]); outExp.push([""]); outXf.push([""]); outEnd.push([""]); continue; }
+    const v = map.get(nm) || { start: 0, inc: 0, exp: 0, xfer: 0 };
+    const endBal = v.start + v.inc - v.exp + v.xfer;
+    outInc.push([v.inc]);
+    outExp.push([v.exp]);
+    outXf.push([v.xfer]);
+    outEnd.push([endBal]);
+  }
+
+  const cInc  = _.c(D.accounts.colIncome);
+  const cExp  = _.c(D.accounts.colExpense);
+  const cXfer = _.c(D.accounts.colTransfers);
+  const cEnd  = _.c(D.accounts.colPredBalance);
+
+  // Write only used rows
+  if (aRowsUse > 0) {
+    sh.getRange(D.accounts.rowStart, cInc,  aRowsUse, 1).setValues(outInc);
+    sh.getRange(D.accounts.rowStart, cExp,  aRowsUse, 1).setValues(outExp);
+    sh.getRange(D.accounts.rowStart, cXfer, aRowsUse, 1).setValues(outXf);
+    sh.getRange(D.accounts.rowStart, cEnd,  aRowsUse, 1).setValues(outEnd);
+
+    // Format only used rows
+    sh.getRangeList([
+      `${D.accounts.colIncome}${D.accounts.rowStart}:${D.accounts.colIncome}${D.accounts.rowStart + aRowsUse - 1}`,
+      `${D.accounts.colExpense}${D.accounts.rowStart}:${D.accounts.colExpense}${D.accounts.rowStart + aRowsUse - 1}`,
+      `${D.accounts.colTransfers}${D.accounts.rowStart}:${D.accounts.colTransfers}${D.accounts.rowStart + aRowsUse - 1}`,
+      `${D.accounts.colPredBalance}${D.accounts.rowStart}:${D.accounts.colPredBalance}${D.accounts.rowStart + aRowsUse - 1}`,
+    ]).setNumberFormat(CFG.formats.money);
+  }
+
+  // Clear any remaining configured rows *below* the used block (keeps the sheet tidy)
+  // NOTE: This does NOT clear your filled rows — only the trailing unused rows.
+  if (aRowsUse < aRowsCfg) {
+    const clearStart = D.accounts.rowStart + aRowsUse;
+    const clearH = aRowsCfg - aRowsUse;
+    sh.getRangeList([
+      `${D.accounts.colIncome}${clearStart}:${D.accounts.colIncome}${clearStart + clearH - 1}`,
+      `${D.accounts.colExpense}${clearStart}:${D.accounts.colExpense}${clearStart + clearH - 1}`,
+      `${D.accounts.colTransfers}${clearStart}:${D.accounts.colTransfers}${clearStart + clearH - 1}`,
+      `${D.accounts.colPredBalance}${clearStart}:${D.accounts.colPredBalance}${clearStart + clearH - 1}`,
+    ]).clearContent();
+  }
+  console.timeEnd("Write results");
+
+  const duration = (new Date() - startTime) / 1000;
+  Logger.log("=== updateDatedAccountBalance END === " + duration + "s");
+}
+
+
 function refreshSourceData(isH2Change){
-  const sh = ss.getSheetByName(D.sheet); if (!sh) return;
-  const targetDate = _.toDate(sh.getRange(D.targetDate).getValue()); if (!targetDate) return;
+  const startTime = new Date();
+  Logger.log("=== refreshSourceData START ===");
+  
+  const ss = __ss();;
+  const sh = ss.getSheetByName(D.sheet);
+  if (!sh) return;
+  
+  const targetDate = _.toDate(sh.getRange(D.targetDate).getValue());
+  if (!targetDate) return;
 
-  try { PAYCHECKS.rebuild(); } catch(_) {}
+  const expenseMaster = EXPENSES.readMaster();
 
-  // isH2Change should be TRUE only when H2 changes, FALSE for everything else
-  _populateExpensesFromMonth(sh, targetDate, !!isH2Change);
-  _populateTransfersFromTP(sh, targetDate, !!isH2Change);
-  _populateIncomeFromPaychecks(sh, targetDate, !!isH2Change);
+  // ✅ NEW: Read ALL existing data in ONE batch
+  console.time("Read all existing data");
+  const existingData = _readAllExistingDatedData(sh, isH2Change);
+  console.timeEnd("Read all existing data");
+
+  // ✅ Pass existing data to each function
+  _populateExpensesFromMonth(sh, targetDate, !!isH2Change, expenseMaster, existingData.expenses);
+  _populateTransfersFromTP(sh, targetDate, !!isH2Change, existingData.transfers);
+// FIX: use sh (the dated sheet you already have), and pass existingData.income
+_populateIncomeFromPaychecks(sh, targetDate, !!isH2Change, existingData.income, _buildAcctByNameFromIncomeMaster_());
 
   SpreadsheetApp.flush();
   updateDatedAccountBalance();
+  
+  const duration = (new Date() - startTime) / 1000;
+  Logger.log("=== refreshSourceData END === " + duration + "s");
 }
- function _populateExpensesFromMonth(datedSh, targetDate, isH2Change){
+
+// ✅ NEW: Read all existing data in one go
+function _readAllExistingDatedData(sh, isH2Change){
+  const D = CFG.datedAccountBalance;
+  
+ // Read expenses (gap-safe)
+const eName = _.c(D.expenses.colName);
+const eRowsEff = _effectiveRows(sh, D.expenses.rowStart, eName, D.expenses.rowEnd);
+const eWidth   = _.c(D.expenses.colInclude) - eName + 1;
+const expensesRaw = eRowsEff > 0
+  ? sh.getRange(D.expenses.rowStart, eName, eRowsEff, eWidth).getValues()
+  : [];
+
+// Read transfers (gap-safe)
+const tName = _.c(D.transfers.colName);
+const tRowsEff = _effectiveRows(sh, D.transfers.rowStart, tName, D.transfers.rowEnd);
+const tWidth   = _.c(D.transfers.colInclude) - tName + 1;
+const transfersRaw = tRowsEff > 0
+  ? sh.getRange(D.transfers.rowStart, tName, tRowsEff, tWidth).getValues()
+  : [];
+
+// Read income (gap-safe)
+const iName = _.c(D.income.colName);
+const iRowsEff = _effectiveRows(sh, D.income.rowStart, iName, D.income.rowEnd);
+const iWidth   = _.c(D.income.colInclude) - iName + 1;
+const incomeRaw = iRowsEff > 0
+  ? sh.getRange(D.income.rowStart, iName, iRowsEff, iWidth).getValues()
+  : [];
+  
+  // Process expenses
+  const expenses = _processExistingExpenses(expensesRaw, isH2Change);
+  
+  // Process transfers
+  const transfers = _processExistingTransfers(transfersRaw, isH2Change);
+  
+  // Process income
+  const income = _processExistingIncome(incomeRaw, isH2Change);
+  
+  return { expenses, transfers, income };
+}
+
+// ✅ NEW: Process existing expenses
+function _processExistingExpenses(data, isH2Change){
+  const D = CFG.datedAccountBalance.expenses;
+  const iName = 0;
+  const iDate = _.c(D.colDate) - _.c(D.colName);
+  const iPred = _.c(D.colPred) - _.c(D.colName);
+  const iAct = _.c(D.colAct) - _.c(D.colName);
+  const iAcct = _.c(D.colAccount) - _.c(D.colName);
+  const iInc = _.c(D.colInclude) - _.c(D.colName);
+
+  const actuals = new Map();
+  const includes = new Map();
+
+  for (const r of data) {
+    const nm = String(r[iName] || "").trim();
+    if (!nm) continue;
+    
+    const dt = _.toDate(r[iDate]);
+    const pred = _.n(r[iPred]);
+    const act = _.n(r[iAct]);
+    const acct = String(r[iAcct] || "").trim();
+    
+    if (dt) {
+      const key = _expKey(nm, dt, pred, acct);
+      if (act > 0) actuals.set(key, act);
+      if (!isH2Change) includes.set(key, r[iInc] === true);
+    }
+  }
+  
+  return { actuals, includes };
+}
+
+// ✅ NEW: Process existing transfers
+function _processExistingTransfers(data, isH2Change){
+  const D = CFG.datedAccountBalance.transfers;
+  const iName = 0;
+  const iDate = _.c(D.colDate) - _.c(D.colName);
+  const iPred = _.c(D.colPred) - _.c(D.colName);
+  const iAct = _.c(D.colAct) - _.c(D.colName);
+  const iFrom = _.c(D.colFromAcct) - _.c(D.colName);
+  const iTo = _.c(D.colToAcct) - _.c(D.colName);
+  const iInc = _.c(D.colInclude) - _.c(D.colName);
+
+  const actuals = new Map();
+  const includes = new Map();
+
+  for (const row of data) {
+    const nm = String(row[iName] || "").trim();
+    if (!nm) continue;
+    
+    const dt = _.toDate(row[iDate]);
+    const pred = _.n(row[iPred]);
+    const from = String(row[iFrom] || "").trim();
+    const to = String(row[iTo] || "").trim();
+    
+    if (dt) {
+      const key = _xferKey(nm, dt, pred, from, to);
+      const act = _.n(row[iAct]);
+      if (act > 0) actuals.set(key, act);
+      if (!isH2Change) includes.set(key, row[iInc] === true);
+    }
+  }
+  
+  return { actuals, includes };
+}
+
+// ✅ NEW: Process existing income
+function _processExistingIncome(data, isH2Change){
+  const DI = CFG.datedAccountBalance.income;
+  const iName = 0;
+  const iDate = _.c(DI.colDate) - _.c(DI.colName);
+  const iPred = _.c(DI.colPred) - _.c(DI.colName);
+  const iAct = _.c(DI.colAct) - _.c(DI.colName);
+  const iAcct = _.c(DI.colAcct) - _.c(DI.colName);
+  const iInc = _.c(DI.colInclude) - _.c(DI.colName);
+
+  const actuals = new Map();
+  const includes = new Map();
+
+  for (const row of data) {
+    const nm = String(row[iName] || "").trim();
+    if (!nm) continue;
+    
+    const dt = _.toDate(row[iDate]);
+    const pred = _.n(row[iPred]);
+    const acct = String(row[iAcct] || "").trim();
+    
+    if (dt) {
+const key = _incKey(nm, dt, pred, acct);
+      const act = _.n(row[iAct]);
+      if (act > 0) actuals.set(key, act);
+      if (!isH2Change) includes.set(key, row[iInc] === true);
+    }
+  }
+  
+  return { actuals, includes };
+}
+
+function _populateExpensesFromMonth(datedSh, targetDate, isH2Change, masterRows, existingData){  // ← ADD existingData parameter
+
+const DE = CFG.datedAccountBalance.expenses;
+const deName = _.c(DE.colName);
+const deDate = _.c(DE.colDate);
+const deFreq = _idxOrNeg(DE.colName, DE.colFreq);
+const deCat  = _.c(DE.colCategory);
+const dePred = _.c(DE.colPred);
+const deAct  = _.c(DE.colAct);
+const deAcct = _.c(DE.colAccount);
+const deInc  = _.c(DE.colInclude);
+
+  const t = new Date();
+  Logger.log("_populateExpensesFromMonth START");
+  
+  const existingActuals = existingData.actuals;  // ← Now it works!
+  const existingIncludes = existingData.includes;
+  
   const y = targetDate.getFullYear();
   const targetMonth = targetDate.getMonth() + 1;
   const D = CFG.datedAccountBalance;
@@ -1945,38 +2578,19 @@ function refreshSourceData(isH2Change){
   const dRows = D.expenses.rowEnd - D.expenses.rowStart + 1;
   const dWidth = _.c(D.expenses.colInclude) - _.c(D.expenses.colName) + 1;
   
-  // Read existing data to preserve Actuals and Include preferences
-  const existing = datedSh.getRange(D.expenses.rowStart, _.c(D.expenses.colName), dRows, dWidth).getValues();
-  
-  const iName = 0;
-  const iDate = _.c(D.expenses.colDate)    - _.c(D.expenses.colName);
-  const iPred = _.c(D.expenses.colPred)    - _.c(D.expenses.colName);
-  const iAct  = _.c(D.expenses.colAct)     - _.c(D.expenses.colName);
-  const iAcct = _.c(D.expenses.colAccount) - _.c(D.expenses.colName);
-  const iInc  = _.c(D.expenses.colInclude) - _.c(D.expenses.colName);
 
-  // Store existing Actuals and Include preferences by key
-  const existingActuals = new Map();
-  const existingIncludes = new Map();
-  
-
-   for (const r of existing) {
-  const nm   = String(r[iName] || "").trim();
-  const dt   = _.toDate(r[iDate]);
-  const pred = _.n(r[iPred]);
-  const act  = _.n(r[iAct]);
-  const acct = String(r[iAcct] || "").trim();
-  if (nm && dt) {
-    const key = _expKey(nm, dt, pred, acct);
-    if (act > 0) existingActuals.set(key, act);
-    existingIncludes.set(key, r[iInc] === true);  // ✅ Fixed
-  }
-}
-  
-
-  // Expand from master
-  const masterRows = EXPENSES.readMaster();
+  console.time("Expand from master");
   const expanded = [];
+
+  function formatFreqForDisplay(freq) {
+    switch(_.normFreq(freq)) {
+      case "WEEKLY": return "Weekly";
+      case "BIWEEKLY": return "Bi-weekly";
+      case "MONTHLY": return "Monthly";
+      case "ONETIME": return "One Time";
+      default: return "Monthly";
+    }
+  }
 
   for (const r of masterRows) {
     const F = _.normFreq(r.freq);
@@ -1991,34 +2605,25 @@ function refreshSourceData(isH2Change){
       }
     } else {
       const anchor = r.start || new Date(y, 0, 1);
-      const dates = _.expand(y, anchor, null, F).filter(d => (d.getMonth() + 1) === targetMonth);
+     const dates = expandMemo(y, anchor, null, F).filter(d => (d.getMonth() + 1) === targetMonth);
       for (const d of dates) {
         expanded.push({ name: r.name, date: d, freq: freqDisplay, cat: r.cat || "", amt, acct: r.acct });
       }
     }
   }
+  console.timeEnd("Expand from master");
 
-  function formatFreqForDisplay(freq) {
-    switch(_.normFreq(freq)) {
-      case "WEEKLY": return "Weekly";
-      case "BIWEEKLY": return "Bi-weekly";
-      case "MONTHLY": return "Monthly";
-      case "ONETIME": return "One Time";
-      default: return "Monthly";
-    }
-  }
-
-  // Build output preserving Actuals
+  console.time("Build output array");
   const outData = Array.from({length: dRows}, () => Array(dWidth).fill(""));
   
   const oName = 0;
   const oDate = _.c(D.expenses.colDate) - _.c(D.expenses.colName);
   const oFreq = _idxOrNeg(D.expenses.colName, D.expenses.colFreq);
-  const oCat  = _.c(D.expenses.colCategory) - _.c(D.expenses.colName);
+  const oCat = _.c(D.expenses.colCategory) - _.c(D.expenses.colName);
   const oPred = _.c(D.expenses.colPred) - _.c(D.expenses.colName);
-  const oAct  = _.c(D.expenses.colAct) - _.c(D.expenses.colName);
+  const oAct = _.c(D.expenses.colAct) - _.c(D.expenses.colName);
   const oAcct = _.c(D.expenses.colAccount) - _.c(D.expenses.colName);
-  const oInc  = _.c(D.expenses.colInclude) - _.c(D.expenses.colName);
+  const oInc = _.c(D.expenses.colInclude) - _.c(D.expenses.colName);
 
   let wrow = 0;
   for (const e of expanded) {
@@ -2029,9 +2634,9 @@ function refreshSourceData(isH2Change){
     outData[wrow][oName] = e.name;
     outData[wrow][oDate] = e.date;
     if (oFreq >= 0) outData[wrow][oFreq] = e.freq;
-    outData[wrow][oCat]  = e.cat;
+    outData[wrow][oCat] = e.cat;
     outData[wrow][oPred] = e.amt;
-    outData[wrow][oAct]  = existingActuals.get(key) || "";  // RESTORE ACTUAL
+    outData[wrow][oAct] = existingActuals.get(key) || "";
     outData[wrow][oAcct] = e.acct;
     
     const defaultInc = (e.date <= targetDate);
@@ -2039,356 +2644,502 @@ function refreshSourceData(isH2Change){
     
     wrow++;
   }
+  console.timeEnd("Build output array");
+
 
   datedSh.getRange(D.expenses.rowStart, _.c(D.expenses.colName), dRows, dWidth).setValues(outData);
+
+// === Batch format (dates + money) for just the rows we filled
+if (wrow > 0) {
+  datedSh.getRangeList([
+    `${D.expenses.colDate}${D.expenses.rowStart}:${D.expenses.colDate}${D.expenses.rowStart + wrow - 1}`
+  ]).setNumberFormat("M/d/yyyy");
+
+  datedSh.getRangeList([
+    `${D.expenses.colPred}${D.expenses.rowStart}:${D.expenses.colPred}${D.expenses.rowStart + wrow - 1}`,
+    `${D.expenses.colAct}${D.expenses.rowStart}:${D.expenses.colAct}${D.expenses.rowStart + wrow - 1}`
+  ]).setNumberFormat("$#,##0.00");
+}
   
-  if (wrow > 0) {
-    datedSh.getRange(D.expenses.rowStart, _.c(D.expenses.colInclude), dRows, 1).insertCheckboxes();
-    _.fmtDate(datedSh.getRange(D.expenses.rowStart, _.c(D.expenses.colDate), wrow, 1));
-    _.fmtMoney(datedSh.getRange(D.expenses.rowStart, _.c(D.expenses.colPred), wrow, 1));
-    _.fmtMoney(datedSh.getRange(D.expenses.rowStart, _.c(D.expenses.colAct), wrow, 1));
-  }
+  Logger.log("_populateExpensesFromMonth END: " + ((new Date() - t) / 1000) + "s");
+}
+function _populateTransfersFromTP(datedSh, targetDate, isH2Change, existingData){
+const DT = CFG.datedAccountBalance.transfers;
+const dtName = _.c(DT.colName);
+const dtDate = _.c(DT.colDate);
+const dtFreq = _.c(DT.colFreq);
+const dtFrom = _.c(DT.colFromAcct);
+const dtPred = _.c(DT.colPred);
+const dtAct  = _.c(DT.colAct);
+const dtTo   = _.c(DT.colToAcct);
+const dtInc  = _.c(DT.colInclude);
+const offDate = dtDate - dtName;
 
-} // ← add this line (end _populateExpensesFromMonth)
+// Hoisted columns for Transfers & Payments source sheet
+const TP = CFG.transfersPayments;
+const tpCName = _.c(TP.colName);
+const tpCDate = _.c(TP.colDate);
+const tpCFreq = _.c(TP.colFreq);
+const tpCFrom = _.c(TP.colFromAcct);
+const tpCTo   = _.c(TP.colToAcct);
+const tpCAmt  = _.c(TP.colAmount);
 
- function _populateTransfersFromTP(datedSh, targetDate, isH2Change){
+  const t = new Date();
+  Logger.log("_populateTransfersFromTP START");
+
+  // === pull existing actuals/includes once ===
+  const existingActuals  = existingData.actuals;
+  const existingIncludes = existingData.includes;
+
   const y = targetDate.getFullYear();
   const targetMonth = targetDate.getMonth() + 1;
-  const D = CFG.datedAccountBalance;
-  const TP = CFG.transfersPayments;
-  const ss = SpreadsheetApp.getActive();
 
-  const n = D.transfers.rowEnd - D.transfers.rowStart + 1;
-  const dWidth = _.c(D.transfers.colInclude) - _.c(D.transfers.colName) + 1;
+  // === shorthand ===
+  const D  = CFG.datedAccountBalance;
+
+  // === cache dated-transfers columns once ===
   
-  const existing = datedSh.getRange(D.transfers.rowStart, _.c(D.transfers.colName), n, dWidth).getValues();
 
-  const iName = 0;
-  const iDate = _.c(D.transfers.colDate) - _.c(D.transfers.colName);
-  const iPred = _.c(D.transfers.colPred) - _.c(D.transfers.colName);
-  const iAct  = _.c(D.transfers.colAct) - _.c(D.transfers.colName);
-  const iFrom = _.c(D.transfers.colFromAcct) - _.c(D.transfers.colName);
-  const iTo   = _.c(D.transfers.colToAcct) - _.c(D.transfers.colName);
-  const iInc  = _.c(D.transfers.colInclude) - _.c(D.transfers.colName);
+  // === row/width for output grid ===
+  const n      = D.transfers.rowEnd - D.transfers.rowStart + 1;
+  const dWidth = dtInc - dtName + 1;
 
-  const existingActuals = new Map();
-  const existingIncludes = new Map();
+  // === read Transfers sheet (cached ss via __ss) ===
+  console.time("Read Transfers sheet");
+  const ss   = __ss();
+  const tpSh = ss.getSheetByName(TP.sheet);
+  if (!tpSh) {
+    Logger.log("_populateTransfersFromTP END: " + ((new Date() - t) / 1000) + "s");
+    return;
+  }
 
-  if (!isH2Change) {
-    for (const row of existing) {
-      const nm = String(row[iName] || "").trim();
-      const dt = _.toDate(row[iDate]);
-      const pred = _.n(row[iPred]);
-      const from = String(row[iFrom] || "").trim();
-      const to = String(row[iTo] || "").trim();
-      
-      if (nm && dt) {
-        const key = _xferKey(nm, dt, pred, from, to);
-        const act = _.n(row[iAct]);
-        if (act > 0) existingActuals.set(key, act);
-        existingIncludes.set(key, row[iInc] === true);
+  // === cache TP columns once ===
+
+const tpWidth  = tpCTo - tpCName + 1;
+const tpRowsEff = _effectiveRows(tpSh, TP.rowStart, tpCName, TP.rowEnd);
+if (tpRowsEff <= 0) { Logger.log("_populateTransfersFromTP: no rows"); return; }
+const tpData = tpSh.getRange(TP.rowStart, tpCName, tpRowsEff, tpWidth).getValues();
+
+  console.timeEnd("Read Transfers sheet");
+
+  // indexers (0-based relative to tpCName)
+  const iTpName   = 0;
+  const iTpDate   = tpCDate - tpCName;
+  const iTpFreq   = tpCFreq - tpCName;
+  const iTpFrom   = tpCFrom - tpCName;
+  const iTpTo     = tpCTo   - tpCName;
+  const iTpAmount = tpCAmt  - tpCName;
+
+  function displayFreq(freq) {
+    switch (_.normFreq(freq)) {
+      case "WEEKLY":   return "Weekly";
+      case "BIWEEKLY": return "Bi-weekly";
+      case "MONTHLY":  return "Monthly";
+      case "ONETIME":  return "One Time";
+      default:         return "Monthly";
+    }
+  }
+
+  // === expand transfers for this month ===
+console.time("Process transfers");
+const expanded = [];
+const validTp  = tpData.filter(r => String(r[iTpName] || "").trim() !== "");
+
+for (const r of validTp) {
+  const name      = String(r[iTpName] || "").trim();
+  const startDate = _.toDate(r[iTpDate]); if (!startDate) continue;
+  const freq      = _.normFreq(r[iTpFreq]);
+  const freqDisp  = displayFreq(r[iTpFreq]);
+  const from      = String(r[iTpFrom] || "").trim();
+  const to        = String(r[iTpTo]   || "").trim();
+  const amt       = _.n(r[iTpAmount]);
+  if (!from || !to || amt <= 0) continue;
+
+  const { firstTime, periodMs } = _firstOccurrenceTimeInMonth(freq, startDate, y, targetMonth);
+  if (firstTime >= 0) {
+    if (freq === "ONETIME" || freq === "MONTHLY") {
+      expanded.push({ name, date:new Date(firstTime), freq:freqDisp, from, to, amount:amt });
+    } else {
+      const monthEnd = new Date(y, targetMonth, 1).getTime(); // exclusive
+      for (let t = firstTime; t < monthEnd; t += periodMs) {
+        expanded.push({ name, date:new Date(t), freq:freqDisp, from, to, amount:amt });
       }
     }
   }
-
-  try { Monthly_UpdateBankAndCategoryFormatting(); } catch(_){}
-try { Monthly_RenderCalendar(); } catch(_){}
-
-
-  const tpSh = ss.getSheetByName(TP.sheet);
-  if (!tpSh) return;
-
-  const tpRows = TP.rowEnd - TP.rowStart + 1;
-  const tpWidth = _.c(TP.colToAcct) - _.c(TP.colName) + 1;
-  const tpData = tpSh.getRange(TP.rowStart, _.c(TP.colName), tpRows, tpWidth).getValues();
-  
-  const iTpName = 0;
-  const iTpDate = _.c(TP.colDate) - _.c(TP.colName);
-  const iTpFreq = _.c(TP.colFreq) - _.c(TP.colName);
-  const iTpFrom = _.c(TP.colFromAcct) - _.c(TP.colName);
-  const iTpTo = _.c(TP.colToAcct) - _.c(TP.colName);
-  const iTpAmount = _.c(TP.colAmount) - _.c(TP.colName);
-
-  function formatFreqForDisplay(freq) {
-    switch(_.normFreq(freq)) {
-      case "WEEKLY": return "Weekly";
-      case "BIWEEKLY": return "Bi-weekly";
-      case "MONTHLY": return "Monthly";
-      case "ONETIME": return "One Time";
-      default: return "Monthly";
-    }
-    } // ← add this line to close the helper
+}
+console.timeEnd("Process transfers");
 
 
-  const expanded = [];
-  for (const r of tpData) {
-    const name = String(r[iTpName] || "").trim();
-    if (!name) continue;
-    
-    const startDate = _.toDate(r[iTpDate]);
-    if (!startDate) continue;
-    
-    const freq = _.normFreq(r[iTpFreq]);
-    const freqDisplay = formatFreqForDisplay(r[iTpFreq]);
-    const from = String(r[iTpFrom] || "").trim();
-    const to = String(r[iTpTo] || "").trim();
-    const amt = _.n(r[iTpAmount]);
-    
-    if (!from || !to || amt <= 0) continue;
-    
-    const dates = _.expand(y, startDate, null, freq).filter(d => (d.getMonth() + 1) === targetMonth);
-    for (const d of dates) {
-      expanded.push({ name, date: d, freq: freqDisplay, from, to, amount: amt });
-    }
+  // === pull CC payments from Dated Expenses (single read) ===
+  console.time("Read CC payments");
+  const DE         = D.expenses;
+  const expNameCol = _.c(DE.colName);
+  const expDateCol = _.c(DE.colDate);
+  const expCatCol  = _.c(DE.colCategory);
+  const expPredCol = _.c(DE.colPred);
+  const expActCol  = _.c(DE.colAct);
+  const expAcctCol = _.c(DE.colAccount);
+  const expWidth   = expAcctCol - expNameCol + 1;
+
+  const expRows = DE.rowEnd - DE.rowStart + 1;
+  const expData = datedSh.getRange(DE.rowStart, expNameCol, expRows, expWidth).getValues();
+
+  const iExpName = 0;
+  const iExpDate = expDateCol - expNameCol;
+  const iExpCat  = expCatCol  - expNameCol;
+  const iExpPred = expPredCol - expNameCol;
+  const iExpAct  = expActCol  - expNameCol;
+  const iExpAcct = expAcctCol - expNameCol;
+
+  const ccCat = ((CFG.creditCards && CFG.creditCards.paymentCategory) || "Credit Card Payment").toUpperCase();
+
+  const monthStart = new Date(y, targetMonth - 1, 1).getTime();
+  const monthEnd   = new Date(y, targetMonth, 0, 23, 59, 59).getTime();
+
+  for (const r of expData) {
+    const cat  = String(r[iExpCat]  || "").trim().toUpperCase();
+    if (cat !== ccCat) continue;
+
+    const name = String(r[iExpName] || "").trim(); if (!name) continue;
+
+    const date = _.toDate(r[iExpDate]); if (!date) continue;
+    const tms  = date.getTime();
+    if (tms < monthStart || tms > monthEnd) continue;
+
+    const fromAcct = String(r[iExpAcct] || "").trim(); if (!fromAcct) continue;
+    const amt = (_.n(r[iExpAct]) > 0) ? _.n(r[iExpAct]) : _.n(r[iExpPred]);
+    if (amt <= 0) continue;
+
+    const toAcct = name.replace(/\s*payment\s*$/i, "").trim();
+    expanded.push({ name, date, freq:"One Time", from:fromAcct, to:toAcct, amount:amt });
   }
+  console.timeEnd("Read CC payments");
 
+  // === build output grid ===
+  console.time("Build output");
   const outData = Array.from({length: n}, () => Array(dWidth).fill(""));
-  
+
+  // 0-based offsets relative to dtName
   const oName = 0;
-  const oDate = _.c(D.transfers.colDate) - _.c(D.transfers.colName);
-  const oFreq = _.c(D.transfers.colFreq) - _.c(D.transfers.colName);
-  const oFrom = _.c(D.transfers.colFromAcct) - _.c(D.transfers.colName);
-  const oPred = _.c(D.transfers.colPred) - _.c(D.transfers.colName);
-  const oAct  = _.c(D.transfers.colAct) - _.c(D.transfers.colName);
-  const oTo   = _.c(D.transfers.colToAcct) - _.c(D.transfers.colName);
-  const oInc  = _.c(D.transfers.colInclude) - _.c(D.transfers.colName);
+  const oDate = dtDate - dtName;
+  const oFreq = dtFreq - dtName;
+  const oFrom = dtFrom - dtName;
+  const oPred = dtPred - dtName;
+  const oAct  = dtAct  - dtName;
+  const oTo   = dtTo   - dtName;
+  const oInc  = dtInc  - dtName;
+
+  const targetTime = targetDate.getTime();
 
   let wrow = 0;
-  for (const t of expanded) {
+  for (const xfer of expanded) {
     if (wrow >= n) break;
-    
-    const key = _xferKey(t.name, t.date, t.amount, t.from, t.to);
-    
-    outData[wrow][oName] = t.name;
-    outData[wrow][oDate] = t.date;
-    outData[wrow][oFreq] = t.freq;
-    outData[wrow][oFrom] = t.from;
-    outData[wrow][oPred] = t.amount;
-    outData[wrow][oAct]  = existingActuals.get(key) || "";  // RESTORE ACTUAL
-    outData[wrow][oTo]   = t.to;
-    
-    const defaultInc = (t.date <= targetDate);
-    outData[wrow][oInc] = isH2Change ? defaultInc : (existingIncludes.has(key) ? existingIncludes.get(key) : defaultInc);
-    
+
+    const key = _xferKey(xfer.name, xfer.date, xfer.amount, xfer.from, xfer.to);
+
+    outData[wrow][oName] = xfer.name;
+    outData[wrow][oDate] = xfer.date;
+    outData[wrow][oFreq] = xfer.freq;
+    outData[wrow][oFrom] = xfer.from;
+    outData[wrow][oPred] = xfer.amount;
+    outData[wrow][oAct]  = existingActuals.get(key) || "";
+    outData[wrow][oTo]   = xfer.to;
+
+    const defaultInc = (xfer.date.getTime() <= targetTime);
+    outData[wrow][oInc] = isH2Change ? defaultInc
+                                     : (existingIncludes.has(key) ? existingIncludes.get(key) : defaultInc);
+
     wrow++;
   }
+  console.timeEnd("Build output");
 
-  datedSh.getRange(D.transfers.rowStart, _.c(D.transfers.colName), n, dWidth).setValues(outData);
-  
-  if (wrow > 0) {
-    datedSh.getRange(D.transfers.rowStart, _.c(D.transfers.colInclude), n, 1).insertCheckboxes();
-    _.fmtDate(datedSh.getRange(D.transfers.rowStart, _.c(D.transfers.colDate), wrow, 1));
-    _.fmtMoney(datedSh.getRange(D.transfers.rowStart, _.c(D.transfers.colPred), wrow, 1));
-    _.fmtMoney(datedSh.getRange(D.transfers.rowStart, _.c(D.transfers.colAct), wrow, 1));
-  }
+  // === single write + format ===
+// === single write + format ===
+console.time("Write and format");
+datedSh.getRange(D.transfers.rowStart, dtName, n, dWidth).setValues(outData);
 
-} // ← add this line (end _populateTransfersFromTP)
+if (wrow > 0) {
+  datedSh.getRangeList([
+    `${D.transfers.colDate}${D.transfers.rowStart}:${D.transfers.colDate}${D.transfers.rowStart + wrow - 1}`
+  ]).setNumberFormat("M/d/yyyy");
 
-function _populateIncomeFromPaychecks(datedSh, targetDate, isH2Change){
+  datedSh.getRangeList([
+    `${D.transfers.colPred}${D.transfers.rowStart}:${D.transfers.colPred}${D.transfers.rowStart + wrow - 1}`,
+    `${D.transfers.colAct}${D.transfers.rowStart}:${D.transfers.colAct}${D.transfers.rowStart + wrow - 1}`
+  ]).setNumberFormat("$#,##0.00");
+}
+console.timeEnd("Write and format");
+
+
+  Logger.log("_populateTransfersFromTP END: " + ((new Date() - t) / 1000) + "s");
+}
+
+
+function _populateIncomeFromPaychecks(datedSh, targetDate, isH2Change, existingData, acctByName){
+  // Hoisted columns for Dated Income
+const DI = CFG.datedAccountBalance.income;
+const diName = _.c(DI.colName);
+const diDate = _.c(DI.colDate);
+const diFreq = _.c(DI.colFreq);
+const diPred = _.c(DI.colPred);
+const diAct  = _.c(DI.colAct);
+const diAcct = _.c(DI.colAcct);
+const diInc  = _.c(DI.colInclude);
+const offDate = diDate - diName;
+
+// Hoisted columns for Paychecks source sheet
+const P = CFG.income.paychecks;
+const pNameCol = _.c(P.colName);
+const pDateCol = _.c(P.colDate);
+const pFreqCol = _.c(P.colFreq);
+const pPredCol = _.c(P.colPred);
+
+  const t = new Date();
+  Logger.log("_populateIncomeFromPaychecks START");
+
+  const existingActuals = existingData.actuals;
+  const existingIncludes = existingData.includes;
   const y = targetDate.getFullYear();
   const targetMonth = targetDate.getMonth() + 1;
   const D = CFG.datedAccountBalance;
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();
 
-  const DI = D.income;
   const n = DI.rowEnd - DI.rowStart + 1;
   const dWidth = _.c(DI.colInclude) - _.c(DI.colName) + 1;
-  
-  const existing = datedSh.getRange(DI.rowStart, _.c(DI.colName), n, dWidth).getValues();
 
-  const iName = 0;
-  const iDate = _.c(DI.colDate) - _.c(DI.colName);
-  const iPred = _.c(DI.colPred) - _.c(DI.colName);
-  const iAct  = _.c(DI.colAct) - _.c(DI.colName);
-  const iAcct = _.c(DI.colAcct) - _.c(DI.colName);
-  const iInc  = _.c(DI.colInclude) - _.c(DI.colName);
-
-  const existingActuals = new Map();
-  const existingIncludes = new Map();
-
-  if (!isH2Change) {
-    for (const row of existing) {
-      const nm = String(row[iName] || "").trim();
-      const dt = _.toDate(row[iDate]);
-      const pred = _.n(row[iPred]);
-      const acct = String(row[iAcct] || "").trim();
-      
-      if (nm && dt) {
-        const key = `INC|${nm}|${dt.toDateString()}|${pred}|${acct}`;
-        const act = _.n(row[iAct]);
-        if (act > 0) existingActuals.set(key, act);
-        existingIncludes.set(key, row[iInc] === true);
-      }
-    }
-  }
-
+  // Read Paychecks (Name, Date, Freq, Pred)
+  console.time("Read paychecks");
   const paySh = ss.getSheetByName(CFG.income.paychecks.sheet);
-  if (!paySh) return;
-
-  const P = CFG.income.paychecks;
-  const pRows = P.rowEnd - P.rowStart + 1;
-  const pWidth = _.c(P.colPred) - _.c(P.colName) + 1;
-  const pData = paySh.getRange(P.rowStart, _.c(P.colName), pRows, pWidth).getValues();
-  
-  const pNm = 0;
-  const pDt = _.c(P.colDate) - _.c(P.colName);
-  const pFq = _.c(P.colFreq) - _.c(P.colName);
-  const pPr = _.c(P.colPred) - _.c(P.colName);
-
-  const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
-  const it = CFG.monthly.incomeTable;
-  const iWidth = _.c(it.colAcct) - _.c(it.colName) + 1;
-  const incData = mSh ? mSh.getRange(it.rowStart, _.c(it.colName), it.rowEnd - it.rowStart + 1, iWidth).getValues() : [];
-  const idxAcct = _.c(it.colAcct) - _.c(it.colName);
-  
-  const acctByName = new Map();
-  for (const r of incData) {
-    const nm = String(r[0] || "").trim();
-    const ac = String(r[idxAcct] || "").trim();
-    if (nm && ac) acctByName.set(nm, ac);
+  if (!paySh) {
+    Logger.log("_populateIncomeFromPaychecks END: " + ((new Date() - t) / 1000) + "s");
+    return;
   }
+const pRowsEff = _effectiveRows(paySh, P.rowStart, pNameCol, P.rowEnd);
+if (pRowsEff <= 0) { Logger.log("_populateIncomeFromPaychecks: no rows"); return; }
+
+  const pWidth = pPredCol - pNameCol + 1;
+const pData = paySh.getRange(P.rowStart, pNameCol, pRowsEff, pWidth).getValues();
+  console.timeEnd("Read paychecks");
+
+  const pNm = 0;
+  const pDt = pDateCol - pNameCol;
+  const pFq = pFreqCol - pNameCol;
+  const pPr = pPredCol - pNameCol;
+
+  // Optionally (re)build acctByName from Month income if the map was not provided
+  if (!acctByName) acctByName = new Map();
+  if (acctByName.size === 0) {
+    console.time("Build account map from Month income");
+    const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
+    const it = CFG.monthly.incomeTable;
+    const iNameCol = _.c(it.colName);
+    const iAcctCol = _.c(it.colAcct);
+    const iWidth = iAcctCol - iNameCol + 1;
+    const incData = mSh ? mSh.getRange(it.rowStart, iNameCol, it.rowEnd - it.rowStart + 1, iWidth).getValues() : [];
+    const idxAcct = iAcctCol - iNameCol;
+
+    for (const r of incData) {
+      const nm = String(r[0] || "").trim();
+      if (!nm) continue;
+      const ac = String(r[idxAcct] || "").trim();
+      if (ac) acctByName.set(nm, ac);
+    }
+    console.timeEnd("Build account map from Month income");
+  }
+
+  // Pre-compute month window
+  console.time("Process paychecks");
+  const monthStart = new Date(y, targetMonth - 1, 1).getTime();
+  const monthEnd   = new Date(y, targetMonth, 0, 23, 59, 59).getTime();
 
   const expanded = [];
-  for (const r of pData) {
+  const validPayData = pData.filter(r => String(r[pNm] || "").trim() !== "");
+
+  for (const r of validPayData) {
     const nm = String(r[pNm] || "").trim();
-    if (!nm) continue;
-    
-    const d = _.toDate(r[pDt]);
-    if (!d || d.getFullYear() !== y || (d.getMonth() + 1) !== targetMonth) continue;
-    
+    const d  = _.toDate(r[pDt]); if (!d) continue;
+    const ts = d.getTime();
+    if (ts < monthStart || ts > monthEnd) continue;
+
     const freqLabel = String(r[pFq] || "").trim();
     const pred = _.n(r[pPr]);
-    const acct = acctByName.get(nm) || "";
-    
-    if (pred > 0) expanded.push({ name: nm, date: d, freq: freqLabel, pred, acct });
-  }
+    if (pred <= 0) continue;
 
+    const acct = acctByName.get(nm) || "";
+    expanded.push({ name: nm, date: d, freq: freqLabel, pred, acct });
+  }
+  console.timeEnd("Process paychecks");
+
+  // Build output
+  console.time("Build output");
   const outData = Array.from({length: n}, () => Array(dWidth).fill(""));
-  
-  const oNm = 0;
-  const oDt = _.c(DI.colDate) - _.c(DI.colName);
-  const oFq = _.c(DI.colFreq) - _.c(DI.colName);
-  const oPr = _.c(DI.colPred) - _.c(DI.colName);
-  const oAc = _.c(DI.colAct) - _.c(DI.colName);
+
+  const oNm   = 0;
+  const oDt   = _.c(DI.colDate) - _.c(DI.colName);
+  const oFq   = _.c(DI.colFreq) - _.c(DI.colName);
+  const oPr   = _.c(DI.colPred) - _.c(DI.colName);
+  const oAc   = _.c(DI.colAct)  - _.c(DI.colName);
   const oAcct = _.c(DI.colAcct) - _.c(DI.colName);
-  const oIn = _.c(DI.colInclude) - _.c(DI.colName);
+  const oIn   = _.c(DI.colInclude) - _.c(DI.colName);
+
+  const targetTime = targetDate.getTime();
 
   let w = 0;
   for (const z of expanded) {
     if (w >= n) break;
-    
-    const key = `INC|${z.name}|${z.date.toDateString()}|${z.pred}|${z.acct}`;
-    
-    outData[w][oNm] = z.name;
-    outData[w][oDt] = z.date;
-    outData[w][oFq] = z.freq;
-    outData[w][oPr] = z.pred;
-    outData[w][oAc] = existingActuals.get(key) || "";  // RESTORE ACTUAL
+
+    const key = _incKey(z.name, z.date, z.pred, z.acct);
+
+    outData[w][oNm]   = z.name;
+    outData[w][oDt]   = z.date;
+    outData[w][oFq]   = z.freq;
+    outData[w][oPr]   = z.pred;
+    outData[w][oAc]   = existingActuals.get(key) || "";
     outData[w][oAcct] = z.acct;
-    
-    const defaultInc = (z.date <= targetDate);
-    outData[w][oIn] = isH2Change ? defaultInc : (existingIncludes.has(key) ? existingIncludes.get(key) : defaultInc);
-    
+
+    const defaultInc = (z.date.getTime() <= targetTime);
+    outData[w][oIn]  = isH2Change ? defaultInc
+                                  : (existingIncludes.has(key) ? existingIncludes.get(key) : defaultInc);
     w++;
   }
+  console.timeEnd("Build output");
 
-  datedSh.getRange(DI.rowStart, _.c(DI.colName), n, dWidth).setValues(outData);
-  
-  if (w > 0) {
-    datedSh.getRange(DI.rowStart, _.c(DI.colInclude), n, 1).insertCheckboxes();
-    _.fmtDate(datedSh.getRange(DI.rowStart, _.c(DI.colDate), w, 1));
-    _.fmtMoney(datedSh.getRange(DI.rowStart, _.c(DI.colPred), w, 1));
-    _.fmtMoney(datedSh.getRange(DI.rowStart, _.c(DI.colAct), w, 1));
-  }
+  // Write + format
+datedSh.getRange(DI.rowStart, _.c(DI.colName), n, dWidth).setValues(outData);
 
-} // ← add this line (end _populateIncomeFromPaychecks)
+if (w > 0) {
+  datedSh.getRangeList([
+    `${DI.colDate}${DI.rowStart}:${DI.colDate}${DI.rowStart + w - 1}`
+  ]).setNumberFormat("M/d/yyyy");
 
+  datedSh.getRangeList([
+    `${DI.colPred}${DI.rowStart}:${DI.colPred}${DI.rowStart + w - 1}`,
+    `${DI.colAct}${DI.rowStart}:${DI.colAct}${DI.rowStart + w - 1}`
+  ]).setNumberFormat("$#,##0.00");
+}
+
+Logger.log("_populateIncomeFromPaychecks END: " + ((new Date() - t) / 1000) + "s");
+}
 
 
 function _sumExpenses(sh, targetDate, map){
   const D = CFG.datedAccountBalance;
-  const n = D.expenses.rowEnd - D.expenses.rowStart + 1;
-  const width = _.c(D.expenses.colInclude) - _.c(D.expenses.colName) + 1;
-  const data = sh.getRange(D.expenses.rowStart, _.c(D.expenses.colName), n, width).getValues();
-  
-  const iDate = _.c(D.expenses.colDate)    - _.c(D.expenses.colName);
-  const iPred = _.c(D.expenses.colPred)    - _.c(D.expenses.colName);
-  const iAct  = _.c(D.expenses.colAct)     - _.c(D.expenses.colName);
-  const iAcc  = _.c(D.expenses.colAccount) - _.c(D.expenses.colName);
-  const iInc  = _.c(D.expenses.colInclude) - _.c(D.expenses.colName);
+  const cName = _.c(D.expenses.colName);
+  const cInc  = _.c(D.expenses.colInclude);
+
+  const nEff = _effectiveRows(sh, D.expenses.rowStart, cName, D.expenses.rowEnd);
+  if (nEff <= 0) return;
+
+  const width = cInc - cName + 1;
+  const data = sh.getRange(D.expenses.rowStart, cName, nEff, width).getValues();
+
+  const iName = 0;
+  const iDate = _.c(D.expenses.colDate)    - cName;
+  const iPred = _.c(D.expenses.colPred)    - cName;
+  const iAct  = _.c(D.expenses.colAct)     - cName;
+  const iAcc  = _.c(D.expenses.colAccount) - cName;
+  const iInc  = _.c(D.expenses.colInclude) - cName;
 
   for (const r of data){
-    const inc  = (r[iInc]===true) || (String(r[iInc]).toUpperCase()==="TRUE") || (r[iInc]===1);
-    if (!inc) continue;
-    
-    const d    = _.toDate(r[iDate]);
-    if (!d || d > targetDate) continue;
-    
-    const amtA = _.n(r[iAct]);
-    const amtP = _.n(r[iPred]);
-    const amt  = (amtA>0 ? amtA : amtP);
-    if (amt<=0) continue;
-    
-    const acc  = String(r[iAcc]||"").trim();
-    if (!acc) continue;
+    const nm = String(r[iName]||"").trim(); if (!nm) continue;
+    if (!_boolCell_(r[iInc])) continue;
 
-    if (map.has(acc)) map.get(acc).exp += amt;
+    const d = _.toDate(r[iDate]); if (!d || d > targetDate) continue;
+
+    const act  = +r[iAct]  || 0;
+    const pred = +r[iPred] || 0;
+    const amt  = act > 0 ? act : pred;
+    if (amt <= 0) continue;
+
+    const acc = String(r[iAcc]||"").trim(); if (!acc) continue;
+    const v = map.get(acc); if (v) v.exp += amt;
   }
 }
 
-function _sumTransfers(sh, targetDate, map){
+
+function _sumTransfers(sh, targetDate, map, isCC){
   const D = CFG.datedAccountBalance;
-  const n = D.transfers.rowEnd - D.transfers.rowStart + 1;
-  const width = _.c(D.transfers.colInclude) - _.c(D.transfers.colName) + 1;
-  const data = sh.getRange(D.transfers.rowStart, _.c(D.transfers.colName), n, width).getValues();
-  
-  const iDate = _.c(D.transfers.colDate)     - _.c(D.transfers.colName);
-  const iFrm  = _.c(D.transfers.colFromAcct) - _.c(D.transfers.colName);
-  const iPred = _.c(D.transfers.colPred)     - _.c(D.transfers.colName);
-  const iAct  = _.c(D.transfers.colAct)      - _.c(D.transfers.colName);
-  const iTo   = _.c(D.transfers.colToAcct)   - _.c(D.transfers.colName);
-  const iInc  = _.c(D.transfers.colInclude)  - _.c(D.transfers.colName);
+  const cName = _.c(D.transfers.colName);
+  const cInc  = _.c(D.transfers.colInclude);
+
+  const nEff = _effectiveRows(sh, D.transfers.rowStart, cName, D.transfers.rowEnd);
+  if (nEff <= 0) return;
+
+  const width = cInc - cName + 1;
+  const data = sh.getRange(D.transfers.rowStart, cName, nEff, width).getValues();
+
+  const iName = 0;
+  const iDate = _.c(D.transfers.colDate)     - cName;
+  const iFrm  = _.c(D.transfers.colFromAcct) - cName;
+  const iPred = _.c(D.transfers.colPred)     - cName;
+  const iAct  = _.c(D.transfers.colAct)      - cName;
+  const iTo   = _.c(D.transfers.colToAcct)   - cName;
+  const iInc  = _.c(D.transfers.colInclude)  - cName;
 
   for (const r of data){
-    const inc = (r[iInc]===true) || (String(r[iInc]).toUpperCase()==="TRUE") || (r[iInc]===1);
-    if (!inc) continue;
-    
-    const d   = _.toDate(r[iDate]);
-    if (!d || d > targetDate) continue;
-    
-    const from= String(r[iFrm]||"").trim();
-    const to  = String(r[iTo] ||"").trim();
-    const amtA = _.n(r[iAct]);
-    const amtP = _.n(r[iPred]);
-    const amt  = (amtA>0 ? amtA : amtP);
-    
-    if (!from || !to || amt<=0) continue;
-    
-    if (map.has(from)) map.get(from).xfer -= amt;
-    if (map.has(to))   map.get(to).xfer   += amt;
-  }
- }
+    const nm = String(r[iName]||"").trim(); if (!nm) continue;
+    if (!_boolCell_(r[iInc])) continue;
 
- function _sumIncomeToDate(sh, targetDate, map){
+    const d = _.toDate(r[iDate]); if (!d || d > targetDate) continue;
+
+    const from = String(r[iFrm]||"").trim();
+    const to   = String(r[iTo] ||"").trim();
+    if (!from || !to) continue;
+
+    const act  = +r[iAct]  || 0;
+    const pred = +r[iPred] || 0;
+    const amt  = act > 0 ? act : pred;
+    if (amt <= 0) continue;
+
+    const fromIsCC = !!isCC.get(from);
+    const toIsCC   = !!isCC.get(to);
+
+    if (fromIsCC && !toIsCC) {
+      if (map.has(from)) map.get(from).xfer += amt;
+      if (map.has(to))   map.get(to).xfer   += amt;
+    } else if (!fromIsCC && toIsCC) {
+      if (map.has(from)) map.get(from).xfer -= amt;
+      if (map.has(to))   map.get(to).xfer   -= amt;
+    } else {
+      if (map.has(from)) map.get(from).xfer -= amt;
+      if (map.has(to))   map.get(to).xfer   += amt;
+    }
+  }
+}
+
+
+
+function _sumIncomeToDate(sh, targetDate, map){
   const DI = CFG.datedAccountBalance.income;
-  const n = DI.rowEnd - DI.rowStart + 1;
-  const width = _.c(DI.colInclude) - _.c(DI.colName) + 1;
-  const data = sh.getRange(DI.rowStart, _.c(DI.colName), n, width).getValues();
-  const iDat = _.c(DI.colDate) - _.c(DI.colName);
-  const iPrd = _.c(DI.colPred) - _.c(DI.colName);
-  const iAcc = _.c(DI.colAcct) - _.c(DI.colName);
-  const iInc = _.c(DI.colInclude) - _.c(DI.colName);
+  const cName = _.c(DI.colName);
+  const cInc  = _.c(DI.colInclude);
+
+  const nEff = _effectiveRows(sh, DI.rowStart, cName, DI.rowEnd);
+  if (nEff <= 0) return;
+
+  const width = cInc - cName + 1;
+  const data = sh.getRange(DI.rowStart, cName, nEff, width).getValues();
+
+  const iDat = _.c(DI.colDate) - cName;
+  const iPrd = _.c(DI.colPred) - cName;
+  const iAcc = _.c(DI.colAcct) - cName;
+  const iInc = _.c(DI.colInclude) - cName;
 
   for (const r of data){
-    const inc = (r[iInc]===true) || (String(r[iInc]).toUpperCase()==="TRUE") || (r[iInc]===1);
-    if (!inc) continue;
-    const d   = _.toDate(r[iDat]);
-    if (!d || d > targetDate) continue;                // ← (unchanged) date gate
-    const amt = _.n(r[iPrd]); if (amt<=0) continue;
+    if (!_boolCell_(r[iInc])) continue;
+
+    const d = _.toDate(r[iDat]); if (!d || d > targetDate) continue;
+
+    const amt = +r[iPrd] || 0; if (amt <= 0) continue;
+
     const acc = String(r[iAcc]||"").trim(); if (!acc) continue;
-    if (map.has(acc)) map.get(acc).inc += amt;
+
+    const v = map.get(acc); if (v) v.inc += amt;
   }
- }
+}
+
+
+
 
 
   return {
@@ -2397,366 +3148,643 @@ function _sumTransfers(sh, targetDate, map){
   };
 })(); // ← end of DATED_ACCOUNT_BALANCE IIFE
 /* ============================= MONTH TAB: Tiles + Calendar + Bank ============================= */
-function Monthly_RenderCalendar(){
+
+var _calendarUpdatePending = false;
+var _calendarLock = false;
+
+function Monthly_RenderCalendar_Safe() {
+  try {
+    const ss = __ss();
+if (_toastThrottle_("__calendar_toast__", 1200)) {
+  ss.toast("Rendering calendar...", "Budget Tracker", -1);
+}
+
+    const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
+    if (!mSh) {
+      ss.toast("", "", 1);  // Clear message
+      return;
+    }
+    
+    const y = _.year();
+    const m = _.monthIdx();
+    
+    const T = CFG.expenses.monthly;
+    
+    const colNameNum = _.c(T.colName);
+    const colDateNum = _.c(T.colDate);
+    const colPredNum = _.c(T.colPred);
+    const colActNum = _.c(T.colAct);
+    const colAcctNum = _.c(T.colAcct);
+    
+    const startCol = Math.min(colNameNum, colDateNum, colPredNum, colActNum, colAcctNum);
+    const endCol = Math.max(colNameNum, colDateNum, colPredNum, colActNum, colAcctNum);
+    
+    const dataStartRow = T.rowStart;
+    const numRows = T.rowEnd - dataStartRow + 1;
+    const numCols = endCol - startCol + 1;
+    
+    const monthData = mSh.getRange(dataStartRow, startCol, numRows, numCols).getValues();
+    
+    const idxName = colNameNum - startCol;
+    const idxDate = colDateNum - startCol;
+    const idxPred = colPredNum - startCol;
+    const idxAct = colActNum - startCol;
+    
+    const occFromMonth = [];
+    for (const r of monthData) {
+      const name = String(r[idxName] || "").trim();
+      const date = _.toDate(r[idxDate]);
+      if (!name || !date) continue;
+      
+      if (date.getFullYear() === y && (date.getMonth() + 1) === m) {
+        const amt = (_.n(r[idxAct]) > 0) ? _.n(r[idxAct]) : _.n(r[idxPred]);
+        if (amt > 0) {
+          occFromMonth.push({ name, date, amt });
+        }
+      }
+    }
+    
+    const transfers = TRANSFERS.readAndExpandForMonth(y, m);
+    Monthly_RenderCalendar(mSh, y, m, occFromMonth, transfers);
+    
+    ss.toast("", "", 1);  // ← Clear message
+    
+  } catch(e) {
+    SpreadsheetApp.getActive().toast("", "", 1);  // Clear on error
+  }
+}
+
+function Monthly_RenderCalendar(mSh, y, m, occExp, occXfer){
+  const stack = new Error().stack;
+  Logger.log("=== Monthly_RenderCalendar CALLED ===");
   const C = CFG.monthly.calendar;
-  const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName(CFG.singleMonth.sheet);
+  const sh = mSh || SpreadsheetApp.getActive().getSheetByName(CFG.singleMonth.sheet);
   if (!sh) return;
 
   const per = C.perDayHeight;
   const contentH = 6;
-  const G = C.dayColGroups;
-  const y = _.year();
-  const m = _.monthIdx();
-
-   const firstDow    = new Date(y, m-1, 1).getDay();
+  const firstDow = new Date(y, m-1, 1).getDay();
   const daysInMonth = new Date(y, m, 0).getDate();
 
-  const leftCol  = _.c("C");
+  const leftCol = _.c("C");
   const rightCol = _.c("AJ");
+  const totalRows = C.perDayHeight * 6;
+  const totalCols = rightCol - leftCol + 1;
 
-  // Clear calendar area and borders, then rebuild
-  const all = sh.getRange(C.startRow, leftCol, C.perDayHeight*6, rightCol-leftCol+1);
-  all.clearContent();
-  all.breakApart();
-  all.setBorder(false,false,false,false,false,false);
+  // Map transfers to same format
+  const occXferMapped = (occXfer || []).map(t => ({ name: `Transfer: ${t.name}`, date: t.date, amt: t.amount }));
+  const occ = (occExp || []).concat(occXferMapped);
 
-  // build expense & transfer occurrences for the current month
-  const occExp  = EXPENSES.computeOccurrences(EXPENSES.readMaster(), y, m);
-const occXfer = TRANSFERS.readAndExpandForMonth(y, m)
-  .map(t => ({ name: `Transfer: ${t.name}`, date: t.date, amt: t.amount }));
-
-  const occ = occExp.concat(occXfer);
-
-  // Group by day, sort items per day (desc amount)
+  // Group by day AND average duplicates with same name
   const byDay = new Map();
   for (const o of occ){
     const d = o.date.getDate();
-    if (!byDay.has(d)) byDay.set(d, []);
-    byDay.get(d).push({ name:o.name, amount:o.amt });
+    if (!byDay.has(d)) byDay.set(d, new Map());
+    
+    const dayMap = byDay.get(d);
+    if (!dayMap.has(o.name)) {
+      dayMap.set(o.name, { name: o.name, amounts: [] });
+    }
+    dayMap.get(o.name).amounts.push(o.amt);
   }
-  for (const items of byDay.values()){
-    items.sort((a,b)=> b.amount - a.amount);
+  
+  // Average and sort
+  const byDayFinal = new Map();
+  for (const [day, nameMap] of byDay.entries()) {
+    const items = [];
+    for (const [name, data] of nameMap.entries()) {
+      const avg = data.amounts.reduce((sum, amt) => sum + amt, 0) / data.amounts.length;
+      items.push({ name, amount: avg });
+    }
+    items.sort((a, b) => b.amount - a.amount);
+    byDayFinal.set(day, items);
   }
 
-  // Draw 6-week grid
+  // Clear and prep calendar area
+  const all = sh.getRange(C.startRow, leftCol, totalRows, totalCols);
+  all.clearContent();
+  all.breakApart();
+  all.setBorder(false,false,false,false,false,false);
+  
+  clearOverflowPanels();
+
+  // Batch operations
+  const mergesToDo = [];
+  const valuesToSet = [];
+  const borderRanges = [];
   const borderStyle = SpreadsheetApp.BorderStyle.SOLID_MEDIUM;
   const color = C.borderColor || "#b7e1cd";
 
-  clearOverflowPanels();
-
   for (let w=0; w<6; w++){
-  const top = C.startRow + w*C.perDayHeight;
+    const top = C.startRow + w*per;
 
-  for (let dgi=0; dgi<7; dgi++){
-    const idx    = w*7 + dgi;
-    const dayNum = 1 + idx - firstDow;
-    if (dayNum < 1 || dayNum > daysInMonth) continue;
+    for (let dgi=0; dgi<7; dgi++){
+      const idx = w*7 + dgi;
+      const dayNum = 1 + idx - firstDow;
+      if (dayNum < 1 || dayNum > daysInMonth) continue;
 
-    const [cStart, cEnd] = C.dayColGroups[dgi];
-    const left  = _.c(cStart);
-    const right = _.c(cEnd);
-    const width = right - left + 1;
+      const [cStart, cEnd] = C.dayColGroups[dgi];
+      const left = _.c(cStart);
+      const right = _.c(cEnd);
+      const width = right - left + 1;
 
-    // Merge each line in the day cell vertically
-    for (let r=0; r<contentH; r++){
-      sh.getRange(top + r, left, 1, width).merge();
-    }
+      // Queue merges
+      for (let r=0; r<contentH; r++){
+        mergesToDo.push(sh.getRange(top + r, left, 1, width));
+      }
 
-    // Outline the day box
-    sh.getRange(top, left, contentH, width)
-      .setBorder(true, true, true, true, false, false, color, borderStyle);
+      // Queue border
+      borderRanges.push(sh.getRange(top, left, contentH, width));
 
-    // Header = day number
-    sh.getRange(top, left).setValue(ordinal(dayNum));
+      // Queue day number
+      valuesToSet.push({
+        range: sh.getRange(top, left),
+        value: ordinal(dayNum)
+      });
 
-    // Fill visible lines
-    const items = byDay.get(dayNum) || [];
-    const visN  = C.visibleLines || 4;
+      const items = byDayFinal.get(dayNum) || [];
+      const visN = C.visibleLines || 4;
 
-    for (let i=0; i<Math.min(items.length, visN); i++){
-      sh.getRange(top+1+i, left, 1, width)
-        .setValue(`${items[i].name} ($${Number(items[i].amount||0).toFixed(0)})`);
-    }
+      // Queue visible items
+      for (let i=0; i<Math.min(items.length, visN); i++){
+        valuesToSet.push({
+          range: sh.getRange(top+1+i, left, 1, width),
+          value: `${items[i].name} ($${Number(items[i].amount||0).toFixed(0)})`
+        });
+      }
 
-    // Handle overflow ("+N more") and store payload for click
-    const hidden = Math.max(0, items.length - visN);
-    if (hidden > 0){
-      const plusCell = sh.getRange(top + (contentH - 1), left);
-      plusCell.setValue(`+${hidden} more`);
+      // Queue +N more
+      const hidden = Math.max(0, items.length - visN);
+      if (hidden > 0){
+        const plusCell = sh.getRange(top + (contentH - 1), left);
+        valuesToSet.push({
+          range: plusCell,
+          value: `+${hidden} more`
+        });
+        
+  _ensureCalendarProtection_(sh, C.startRow, _.c("C"), C.perDayHeight * 6, _.c("AJ") - _.c("C") + 1);
 
-      const cellA1 = plusCell.getA1Notation();
-      STATE.set(_overflowKeyForA1(cellA1), JSON.stringify({ y, m, day: dayNum, items }));
+      }
     }
   }
-}
 
-  // Protect with warning-only (best effort)
+  // Execute all merges
+  for (const r of mergesToDo) r.merge();
+
+  // Execute all borders
+  for (const r of borderRanges) {
+    r.setBorder(true, true, true, true, false, false, color, borderStyle);
+  }
+
+  // Execute all values
+  for (const {range, value} of valuesToSet) {
+    range.setValue(value);
+  }
+
+  SpreadsheetApp.flush();
+
+  // Protect
   try {
-    const calendarRange = sh.getRange(C.startRow, leftCol, C.perDayHeight*6, rightCol-leftCol+1);
+    const calendarRange = sh.getRange(C.startRow, leftCol, totalRows, totalCols);
     const p = calendarRange.protect();
     p.setDescription("Calendar (auto-generated)");
     p.setWarningOnly(true);
-  } catch(e){ /* simple triggers / perms can fail here; ignore */ }
+  } catch(e){ }
 }
+function _shouldRun_(key, ms){
+  const p = PropertiesService.getDocumentProperties();
+  const last = Number(p.getProperty(key) || "0");
+  const now  = Date.now();
+  if (now - last < (ms||400)) return false;
+  p.setProperty(key, String(now));
+  return true;
+}
+// Helper function
+function showUpdating(message) {
+  const ss = __ss();;
+  const toast = ss.toast(message || "Updating...", "Budget Tracker", -1);  // -1 = stays until dismissed
+}
+
+function hideUpdating() {
+  SpreadsheetApp.getActiveSpreadsheet().toast("Done!", "Budget Tracker", 1);
+}
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+function Lists_SyncCreditCardPayment() {
+  const ss = __ss();;
+  const lists = ss.getSheetByName("_Lists");
+  if (!lists) return;
+  
+  const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
+  if (!mSh) return;
+  
+  const B = CFG.bank;
+  const n = B.rowEnd - B.rowStart + 1;
+  const markCol = (CFG.creditCards && CFG.creditCards.bankMarkCol) || "O";
+  
+  const accounts = mSh.getRange(B.rowStart, _.c(B.colName), n, 1).getValues().map(r => String(r[0]||"").trim());
+  const ccMarks = mSh.getRange(B.rowStart, _.c(markCol), n, 1).getValues();
+  
+  // Get CC account names
+  const ccAccounts = [];
+  for (let i = 0; i < accounts.length; i++) {
+    const v = ccMarks[i][0];
+    const isCC = v === true || String(v).toUpperCase()==="TRUE" || v === 1;
+    if (isCC && accounts[i]) {
+      ccAccounts.push(accounts[i] + " Payment");
+    }
+  }
+  
+  // Get current expense names from column C
+  const maxRows = 200;
+  const currentNames = lists.getRange(2, 3, maxRows, 1).getValues().map(r => String(r[0]||"").trim()).filter(n => n !== "");
+  
+  // Remove old CC payment names
+  const filtered = currentNames.filter(n => !n.endsWith(" Payment"));
+  
+  // Add new CC payment names
+  const updated = [...filtered, ...ccAccounts].sort();
+  
+  lists.getRange(2, 3, maxRows, 1).clearContent();
+  if (updated.length > 0) {
+    lists.getRange(2, 3, updated.length, 1).setValues(updated.map(n => [n]));
+  }
+  
+  Lists_ApplyValidations();
+}
+
+
+// ADD THESE THREE FUNCTIONS RIGHT HERE:
+// === Helpers (cache, column offset, first occurrence in month) ===
+if (typeof __ss !== 'function') {
+  var __ss_cache = null;
+  function __ss() {
+    return (__ss_cache && __ss_cache.getId) ? __ss_cache : (__ss_cache = SpreadsheetApp.getActive());
+  }
+}
+
+if (typeof _idxOrNeg !== 'function') {
+  // Returns 0-based offset of `maybeCol` relative to `baseCol`, or -1 if not present.
+  function _idxOrNeg(baseCol, maybeCol) {
+    if (!maybeCol) return -1;
+    try { return _.c(maybeCol) - _.c(baseCol); } catch(_) { return -1; }
+  }
+}
+
+if (typeof _firstOccurrenceTimeInMonth !== 'function') {
+  // Compute first occurrence (ms epoch) of a recurring item within (y, m=1..12),
+  // anchored at `start`. Returns { firstTime, periodMs }. -1 if none.
+  function _firstOccurrenceTimeInMonth(freq, start, y, m) {
+    const F = _.normFreq(freq);
+    const s = start ? new Date(start) : new Date(y, 0, 1);
+    const monthStart = new Date(y, m - 1, 1).getTime();
+    const monthEnd   = new Date(y, m,     1).getTime(); // exclusive
+
+    if (F === "ONETIME") {
+      const st = s.getTime();
+      return (st >= monthStart && st < monthEnd) ? { firstTime: st, periodMs: 0 }
+                                                 : { firstTime: -1, periodMs: 0 };
+    }
+
+    if (F === "MONTHLY") {
+      const dom = s.getDate();
+      const dim = new Date(y, m, 0).getDate();
+      const d   = Math.min(dom, dim);
+      const t   = new Date(y, m - 1, d).getTime();
+
+      // If the anchor itself is inside this month and after the anchored day, no hit.
+      if (s.getFullYear() === y && (s.getMonth() + 1) === m && t < s.getTime()) {
+        return { firstTime: -1, periodMs: 0 };
+      }
+      return (t >= monthStart && t < monthEnd && t >= s.getTime())
+        ? { firstTime: t, periodMs: 30 * 86400000 }   // periodMs unused for MONTHLY loop step
+        : { firstTime: -1, periodMs: 0 };
+    }
+
+    // WEEKLY / BIWEEKLY
+    const pMs = (F === "WEEKLY" ? 7 : 14) * 86400000;
+    if (s.getTime() >= monthEnd) return { firstTime: -1, periodMs: 0 };
+
+    const base = s.getTime();
+    const startAt = Math.max(base, monthStart);
+    const k = Math.ceil((startAt - base) / pMs);
+    const first = base + k * pMs;
+
+    return (first >= monthEnd) ? { firstTime: -1, periodMs: 0 }
+                               : { firstTime: first, periodMs: pMs };
+  }
+}
+
+
+
 
 /* ============================= BANK TOTALS + CATEGORY TABLE + TOP TILES ============================= */
 function Monthly_UpdateBankAndCategoryFormatting(){
-  const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName(CFG.singleMonth.sheet); if (!sh) return;
+  console.time("Monthly_UpdateBankAndCategoryFormatting");
+  const ss = __ss();
+  const sh = ss.getSheetByName(CFG.singleMonth.sheet);
+  if (!sh) return;
 
   const B = CFG.bank;
   const n = B.rowEnd - B.rowStart + 1;
 
-  // Account names + Pred Begin (user-managed)
-  const accounts   = sh.getRange(B.rowStart, _.c(B.colName), n, 1).getValues().map(r => String(r[0]||"").trim());
-  const predBegins = sh.getRange(B.rowStart, _.c(B.colPredBegin), n, 1).getValues().map(r => _.n(r[0]));
-
-  const markCol = (CFG.creditCards && CFG.creditCards.bankMarkCol) || "O";
-const ccMarks = sh.getRange(B.rowStart, _.c(markCol), n, 1).getValues().map(r => {
-  const v = r[0];
-  return v === true || String(v).toUpperCase()==="TRUE" || v === 1;
-});
-const isCC = new Map();
-for (let i=0;i<accounts.length;i++){ if (accounts[i]) isCC.set(accounts[i], !!ccMarks[i]); }
-
-
-
-  // Income AEP by account
-  const incByAcct = new Map();
-  {
-    const t = CFG.monthly.incomeTable;
-    const width = _.c(t.colAcct) - _.c(t.colName) + 1;
-    const data  = sh.getRange(t.rowStart, _.c(t.colName), t.rowEnd - t.rowStart + 1, width).getValues();
-    const iPred = _.c(t.colPred) - _.c(t.colName);
-    const iAct  = _.c(t.colAct)  - _.c(t.colName);
-    const iAcc  = _.c(t.colAcct) - _.c(t.colName);
-
-    for (const r of data){
-      const acct = String(r[iAcc]||"").trim(); if (!acct) continue;
-      const aep  = (_.n(r[iAct]) > 0) ? _.n(r[iAct]) : _.n(r[iPred]);
-      if (aep > 0) incByAcct.set(acct, (incByAcct.get(acct)||0) + aep);
-    }
+  // ✅ OPTIMIZATION 1: Read bank data in ONE batch
+  const bankCols = Math.max(_.c(B.colName), _.c(B.colPredBegin), _.c((CFG.creditCards && CFG.creditCards.bankMarkCol) || "O")) - _.c(B.colName) + 1;
+  const bankData = sh.getRange(B.rowStart, _.c(B.colName), n, bankCols).getValues();
+  
+  const accounts    = bankData.map(r => String(r[0]||"").trim());
+  const predBegins  = bankData.map(r => _.n(r[_.c(B.colPredBegin) - _.c(B.colName)]));
+  const markCol     = (CFG.creditCards && CFG.creditCards.bankMarkCol) || "O";
+  const ccMarks     = bankData.map(r => {
+    const v = r[_.c(markCol) - _.c(B.colName)];
+    return v === true || String(v).toUpperCase()==="TRUE" || v === 1;
+  });
+  
+  const isCC = new Map();
+  for (let i=0; i<accounts.length; i++){
+    if (accounts[i]) isCC.set(accounts[i], !!ccMarks[i]);
   }
 
-// Expense AEP by account + CC-payment split + month totals for tiles
-const expByAcct = new Map();
-let monthTotalNoCCPay = 0;   // -> Month!M2
-let monthTotalCCPay   = 0;   // -> Month!M10
+  // ✅ OPTIMIZATION 2: Read income & expense tables ONCE
+  const t = CFG.monthly.incomeTable;
+  const iWidth  = _.c(t.colAcct) - _.c(t.colName) + 1;
+  const incData = sh.getRange(t.rowStart, _.c(t.colName), t.rowEnd - t.rowStart + 1, iWidth).getValues();
+  
+  const et = CFG.monthly.expenseTable;
+  const eWidth  = _.c(et.colAcct) - _.c(et.colName) + 1;
+  const expData = sh.getRange(et.rowStart, _.c(et.colName), et.rowEnd - et.rowStart + 1, eWidth).getValues();
 
-{
-  const t = CFG.monthly.expenseTable;
-  const width = _.c(t.colAcct) - _.c(t.colName) + 1;
-  const data  = sh.getRange(t.rowStart, _.c(t.colName), t.rowEnd - t.rowStart + 1, width).getValues();
-
-  const iName = 0;
-  const iCat  = _.c(t.colCat)  - _.c(t.colName);
+  // ✅ OPTIMIZATION 3: Process income & expenses in single pass
+  const incByAcct = new Map();
   const iPred = _.c(t.colPred) - _.c(t.colName);
   const iAct  = _.c(t.colAct)  - _.c(t.colName);
   const iAcc  = _.c(t.colAcct) - _.c(t.colName);
 
+  for (const r of incData){
+    const acct = String(r[iAcc]||"").trim();
+    if (!acct) continue;
+    const act  = +r[iAct]  || 0;
+    const pred = +r[iPred] || 0;
+    const aep  = act > 0 ? act : pred;
+    if (aep <= 0) continue;
+    incByAcct.set(acct, (incByAcct.get(acct) || 0) + aep);
+  }
+
+  // Expense processing
+  const expByAcct = new Map();
+  const ccPaymentsByFromAcct = new Map();
+  
+  let monthTotalNoCCPay = 0;
+  let monthTotalCCPay   = 0;
+
+  const eCat  = _.c(et.colCat)  - _.c(et.colName);
+  const ePred = _.c(et.colPred) - _.c(et.colName);
+  const eAct  = _.c(et.colAct)  - _.c(et.colName);
+  const eAcc  = _.c(et.colAcct) - _.c(et.colName);
+
   const ccPaymentCatUpper = ((CFG.creditCards && CFG.creditCards.paymentCategory) || "Credit Card Payment").toUpperCase();
 
-  for (const r of data){
-    const name = String(r[iName]||"").trim();
-    const cat  = String(r[iCat] ||"").trim().toUpperCase();
-    const acct = String(r[iAcc] ||"").trim();
-    const aep  = (_.n(r[iAct]) > 0) ? _.n(r[iAct]) : _.n(r[iPred]);
+  // ✅ OPTIMIZATION 4: Filter empty rows BEFORE processing
+  const validExpRows = expData.filter(r => String(r[0]||"").trim() !== "");
+  
+  for (const r of validExpRows) {
+    const cat  = String(r[eCat] || "").trim().toUpperCase();
+    const acct = String(r[eAcc] || "").trim();
+    const act  = +r[eAct]  || 0;
+    const pred = +r[ePred] || 0;
+    const aep  = act > 0 ? act : pred;
     if (aep <= 0) continue;
 
+    const isOnCCAccount = isCC.get(acct);
+
     if (cat === ccPaymentCatUpper) {
-      monthTotalCCPay += aep;                      // for M10
-      if (acct) expByAcct.set(acct, (expByAcct.get(acct)||0) + aep);
-    } else {
-      monthTotalNoCCPay += aep;                    // for M2
+      monthTotalCCPay += aep;
+      if (acct) {
+        expByAcct.set(acct, (expByAcct.get(acct)||0) + aep);
+        ccPaymentsByFromAcct.set(acct, (ccPaymentsByFromAcct.get(acct)||0) + aep);
+      }
+    } else if (!isOnCCAccount) {
+      monthTotalNoCCPay += aep;
       if (acct) expByAcct.set(acct, (expByAcct.get(acct)||0) + aep);
     }
   }
-}
 
-// Write Month tiles
-try {
-  sh.getRange("M2").setValue(monthTotalNoCCPay).setNumberFormat(CFG.formats.money);
-  sh.getRange("M10").setValue(monthTotalCCPay).setNumberFormat(CFG.formats.money);
-  sh.getRange("H10").setValue(monthTotalNoCCPay + monthTotalCCPay).setNumberFormat(CFG.formats.money);
-} catch(_) {}
+  // Write tiles
+  try {
+    sh.getRange("M2:M10").setValues([
+      [monthTotalNoCCPay],
+      [""], [""], [""], [""], [""], [""], [""],
+      [monthTotalCCPay]
+    ]).setNumberFormat(CFG.formats.money);
+    
+    sh.getRange("H10").setValue(monthTotalNoCCPay + monthTotalCCPay).setNumberFormat(CFG.formats.money);
+  } catch(_) {}
 
-
-// Write Month tiles you asked for
-try {
-  sh.getRange("M2").setValue(monthTotalNoCCPay).setNumberFormat(CFG.formats.money); // total spending (no CC payments)
-  sh.getRange("M10").setValue(monthTotalCCPay).setNumberFormat(CFG.formats.money);  // total CC payments
-  sh.getRange("H10").setValue(monthTotalNoCCPay + monthTotalCCPay).setNumberFormat(CFG.formats.money);
-} catch(_) {}
-
-
-  // Net transfers for current month only (expanded by frequency)
+  // ✅ OPTIMIZATION 5: Read transfers ONCE
   const y = _.year(), m = _.monthIdx();
   const xferByAcct = new Map();
-  for (const t of TRANSFERS.readAndExpandForMonth(y, m)){
-    xferByAcct.set(t.from, (xferByAcct.get(t.from)||0) - t.amount);
-    xferByAcct.set(t.to,   (xferByAcct.get(t.to)||0)   + t.amount);
+  
+  const allTransfers = TRANSFERS.readAndExpandForMonth(y, m);
+  for (const tfr of allTransfers){
+    const fromIsCC = isCC.get(tfr.from);
+    const toIsCC   = isCC.get(tfr.to);
+    
+    if (fromIsCC && !toIsCC) {
+      xferByAcct.set(tfr.from, (xferByAcct.get(tfr.from)||0) + tfr.amount);
+      xferByAcct.set(tfr.to,   (xferByAcct.get(tfr.to)||0)   + tfr.amount);
+    } else if (!fromIsCC && toIsCC) {
+      xferByAcct.set(tfr.from, (xferByAcct.get(tfr.from)||0) - tfr.amount);
+      xferByAcct.set(tfr.to,   (xferByAcct.get(tfr.to)||0)   - tfr.amount);
+    } else {
+      xferByAcct.set(tfr.from, (xferByAcct.get(tfr.from)||0) - tfr.amount);
+      xferByAcct.set(tfr.to,   (xferByAcct.get(tfr.to)||0)   + tfr.amount);
+    }
   }
 
-// Write P/T/W/Y and money formats
+  // adjust CC acct balances for payments recorded as expenses-from-cash
+  for (const [fromAcct, paymentAmt] of ccPaymentsByFromAcct.entries()) {
+    for (const ccAcct of accounts) {
+      if (isCC.get(ccAcct)) {
+        xferByAcct.set(ccAcct, (xferByAcct.get(ccAcct)||0) - paymentAmt);
+      }
+    }
+  }
+
+// Build CC charges map from rows we've already read (no second sheet read)
+const chargesByAcct = new Map();
+for (const r of validExpRows) {
+  const acct = String(r[eAcc] || "").trim(); if (!acct) continue;
+  const cat  = String(r[eCat] || "").trim().toUpperCase();
+  const act  = +r[eAct]  || 0;
+  const pred = +r[ePred] || 0;
+  const aep  = act > 0 ? act : pred;
+  if (aep <= 0) continue;
+  // “charges” = all non-CC-Payment spend on card accounts; exclude CC Payment category
+  if (cat !== ccPaymentCatUpper && isCC.get(acct)) {
+    chargesByAcct.set(acct, (chargesByAcct.get(acct) || 0) + aep);
+  }
+}
+
+// Compute predicted end by account
 const outExp=[], outInc=[], outXf=[], outEnd=[];
-
-// Get CC charge/payment splits
-const ccSplits = _CC_computeExpenseSplits_();
-
-for (let i=0;i<accounts.length;i++){
+for (let i=0; i<accounts.length; i++){
   const acc = accounts[i];
   if (!acc){ outExp.push([""]); outInc.push([""]); outXf.push([""]); outEnd.push([""]); continue; }
-  
-  const inc = incByAcct.get(acc) || 0;
+
+  const inc   = incByAcct.get(acc)  || 0;
   const xfers = xferByAcct.get(acc) || 0;
-  const begin = predBegins[i] || 0;
-  
+  const begin = predBegins[i]       || 0;
+
   let exp, endBalance;
-  
   if (isCC.get(acc)) {
-    // CC account: charges ADD to balance (you owe more), payments SUBTRACT (paying it off)
-    const charges = ccSplits.chargesByAcct.get(acc) || 0;
-    const payments = ccSplits.paymentsByAcct.get(acc) || 0;
-    exp = charges; // Only show charges as "expenses" for CC
-    endBalance = begin + charges - payments + xfers;
+    const charges = chargesByAcct.get(acc) || 0;
+    exp = charges;
+    endBalance = begin + charges + xfers;  // CC “balance” grows by charges; xfers adjust it
   } else {
-    // Regular account: all expenses SUBTRACT from balance
     exp = expByAcct.get(acc) || 0;
     endBalance = begin + inc - exp + xfers;
   }
-  
+
   outExp.push([exp]);
   outInc.push([inc]);
   outXf.push([xfers]);
   outEnd.push([endBalance]);
 }
 
-sh.getRange(B.rowStart, _.c(B.colExpTotal),    n, 1).setValues(outExp);
-sh.getRange(B.rowStart, _.c(B.colIncomeTotal), n, 1).setValues(outInc);
-sh.getRange(B.rowStart, _.c(B.colTransfer),    n, 1).setValues(outXf);
-sh.getRange(B.rowStart, _.c(B.colPredEnd),     n, 1).setValues(outEnd);
 
-  _.fmtMoney(sh.getRange(B.rowStart, _.c(B.colPredBegin),   n, 1));
-  _.fmtMoney(sh.getRange(B.rowStart, _.c(B.colExpTotal),    n, 1));
-  _.fmtMoney(sh.getRange(B.rowStart, _.c(B.colIncomeTotal), n, 1));
-  _.fmtMoney(sh.getRange(B.rowStart, _.c(B.colTransfer),    n, 1));
-  _.fmtMoney(sh.getRange(B.rowStart, _.c(B.colPredEnd),     n, 1));
-  _.fmtMoney(sh.getRange(B.rowStart, _.c(B.colActEnd),      n, 1));
+  // ===== BATCH WRITE =====
+  sh.getRange(B.rowStart, _.c(B.colExpTotal),   n, 1).setValues(outExp);
+  sh.getRange(B.rowStart, _.c(B.colIncomeTotal),n, 1).setValues(outInc);
+  sh.getRange(B.rowStart, _.c(B.colTransfer),   n, 1).setValues(outXf);
+  sh.getRange(B.rowStart, _.c(B.colPredEnd),    n, 1).setValues(outEnd);
 
-  // Refresh the Month category rollup table
-  Expenses_UpdateCategories_INO();
+  // ===== 4D: Batch format the four money columns (optional if your _Bank_FormatMoneyColumns_ already does this) =====
+  sh.getRangeList([
+    `${B.colExpTotal}${B.rowStart}:${B.colExpTotal}${B.rowEnd}`,
+    `${B.colIncomeTotal}${B.rowStart}:${B.colIncomeTotal}${B.rowEnd}`,
+    `${B.colTransfer}${B.rowStart}:${B.colTransfer}${B.rowEnd}`,
+    `${B.colPredEnd}${B.rowStart}:${B.colPredEnd}${B.rowEnd}`
+  ]).setNumberFormat(CFG.formats.money);
 
-  // Refresh top tiles (income, expense, avgDaily, ratio, flow, hi/lo/subs)
-  const T  = CFG.monthly.tiles;
-  const IT = CFG.monthly.incomeTable;
-  const ET = CFG.monthly.expenseTable;
+  // If your helper formats these, you can keep this or remove one of them
+  try { _Bank_FormatMoneyColumns_(); } catch(_) {}
 
-  const incomeTotal  = _.sumAEP_block(sh, IT.rowStart, IT.rowEnd, IT.colPred, IT.colAct);
-  const expenseTotal = _.sumAEP_block(sh, ET.rowStart, ET.rowEnd, ET.colPred, ET.colAct);
+  // Category rollup (reuse validExpRows!)
+  _Expenses_UpdateCategories_Fast(sh, validExpRows, eCat, ePred, eAct);
+
+  // Top tiles
+  const TILES = CFG.monthly.tiles;
+  const incomeTotal  = _.sumAEP_block(sh, t.rowStart,  t.rowEnd,  t.colPred,  t.colAct);
+  const expenseTotal = _.sumAEP_block(sh, et.rowStart, et.rowEnd, et.colPred, et.colAct);
 
   const { y:yy, m:mm } = _.currentYM ? _.currentYM() : { y:_.year(), m:_.monthIdx() };
-  const daysInMonth  = new Date(yy, mm, 0).getDate();
-  const avgDaily     = (expenseTotal>0 && daysInMonth>0) ? (expenseTotal/daysInMonth) : 0;
-  const ratio        = (incomeTotal>0) ? (expenseTotal/incomeTotal) : 0;
-  const flow         = incomeTotal - expenseTotal;
+  const dim      = new Date(yy, mm, 0).getDate();
+  const avgDaily = (expenseTotal>0 && dim>0) ? (expenseTotal/dim) : 0;
+  const ratio    = (incomeTotal>0) ? (expenseTotal/incomeTotal) : 0;
+  const flow     = incomeTotal - expenseTotal;
 
-  sh.getRange(T.income).setValue(incomeTotal).setNumberFormat(CFG.formats.money);
-  sh.getRange(T.expense).setValue(expenseTotal).setNumberFormat(CFG.formats.money);
-  sh.getRange(T.avgDaily).setValue(avgDaily).setNumberFormat(CFG.formats.money);
-  sh.getRange(T.ratio).setValue(ratio).setNumberFormat(CFG.formats.percent1);
-  sh.getRange(T.flow).setValue(flow).setNumberFormat(CFG.formats.money);
+  sh.getRange(TILES.income).setValue(incomeTotal).setNumberFormat(CFG.formats.money);
+  sh.getRange(TILES.expense).setValue(expenseTotal).setNumberFormat(CFG.formats.money);
+  sh.getRange(TILES.avgDaily).setValue(avgDaily).setNumberFormat(CFG.formats.money);
+  sh.getRange(TILES.ratio).setValue(ratio).setNumberFormat(CFG.formats.percent1);
+  sh.getRange(TILES.flow).setValue(flow).setNumberFormat(CFG.formats.money);
 
-  // Hi/Lo tiles & subs from the Month expense table (AEP)
-  (function(){
-    const startCol = _.c(ET.colName);
-    const width    = _.c(ET.colAct) - startCol + 1;
-    const rowsN    = ET.rowEnd - ET.rowStart + 1;
-    const data     = sh.getRange(ET.rowStart, startCol, rowsN, width).getValues();
+  // Hi/Lo tiles (reuse validExpRows!)
+  _updateHiLoTiles_Fast(sh, validExpRows, eCat, ePred, eAct, TILES);
+  
+  console.timeEnd("Monthly_UpdateBankAndCategoryFormatting");
+}
 
-    const idxName = 0;
-    const idxCat  = _.c(ET.colCat)  - startCol;
-    const idxPred = _.c(ET.colPred) - startCol;
-    const idxAct  = _.c(ET.colAct)  - startCol;
 
-    let hiExpVal = 0, hiExpName = "";
-    let loExpVal = Number.POSITIVE_INFINITY, loExpName = "";
-    const catTotals = new Map();
-    let subsTotal = 0;
+// ✅ NEW: Faster category update (reuses already-read data)
+function _Expenses_UpdateCategories_Fast(sh, expData, idxCat, idxPred, idxAct){
+  const E = CFG.monthly.categoryTable;
+  const IT = CFG.monthly.incomeTable;
+  
+  const incomeAEP = _.sumAEP_block(sh, IT.rowStart, IT.rowEnd, IT.colPred, IT.colAct);
+  const map = new Map();
 
-    for (const row of data){
-      const name = String(row[idxName] || "").trim();
-      if (!name) continue;
-
-      const cat = String(row[idxCat] || "").trim();
-      const pred = _.n(row[idxPred]);
-      const act  = _.n(row[idxAct]);
-      const aep  = (act > 0) ? act : pred;
-      if (aep <= 0) continue;
-
-      if (aep > hiExpVal){ hiExpVal = aep; hiExpName = name; }
-      if (aep < loExpVal){ loExpVal = aep; loExpName = name; }
-
-      if (cat){
-        catTotals.set(cat, (catTotals.get(cat) || 0) + aep);
-        if (cat === CFG.monthly.subscriptionsCategory) subsTotal += aep;
-      }
-    }
-
-    let hiCatName = "", loCatName = "";
-    if (catTotals.size){
-      const sorted = [...catTotals.entries()].filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]);
-      if (sorted.length){
-        hiCatName = sorted[0][0];
-        loCatName = sorted[sorted.length-1][0];
-      }
-    }
-
-    sh.getRange(T.hiCat).setValue(hiCatName || "")
-      .setNote(hiCatName ? ("Total: $" + (catTotals.get(hiCatName)||0).toFixed(2)) : "");
-    sh.getRange(T.loCat).setValue(loCatName || "")
-      .setNote(loCatName ? ("Total: $" + (catTotals.get(loCatName)||0).toFixed(2)) : "");
-    sh.getRange(T.hiExp).setValue(hiExpName || "")
-      .setNote(hiExpVal>0 ? ("Amount: $" + hiExpVal.toFixed(2)) : "");
-    sh.getRange(T.loExp).setValue((isFinite(loExpVal)&&loExpVal>0)?loExpName:"")
-      .setNote((isFinite(loExpVal)&&loExpVal>0)?("Amount: $" + loExpVal.toFixed(2)):"");
-
-    sh.getRange(T.subs).setValue(subsTotal).setNumberFormat(CFG.formats.money);
-  })();
-  // ADD THIS at the end of Monthly_UpdateBankAndCategoryFormatting
-// Write Expense sheet tiles
-try {
-  const expSh = ss.getSheetByName(CFG.expenses.master.sheet);
-  if (expSh) {
-    expSh.getRange("H2").setValue(monthTotalNoCCPay).setNumberFormat(CFG.formats.money);
-    expSh.getRange("H6").setValue(monthTotalNoCCPay + monthTotalCCPay).setNumberFormat(CFG.formats.money);
-    expSh.getRange("M6").setValue(monthTotalCCPay).setNumberFormat(CFG.formats.money);
+  for (const r of expData){
+    const cat = String(r[idxCat]||"").trim();
+    if(!cat) continue;
+    const aep = (_.n(r[idxAct])>0 ? _.n(r[idxAct]) : _.n(r[idxPred]));
+    if (aep>0) map.set(cat,(map.get(cat)||0)+aep);
   }
-} catch(_) {}
+  
+  const sorted = [...map.entries()].sort((a,b)=>b[1]-a[1]);
+  const outH = E.rowEnd-E.rowStart+1;
+  const outW = _.c(E.colPct)-_.c(E.colLabel)+1;
+  const buf = Array.from({length: outH}, ()=>Array(outW).fill(""));
+
+  const offTotal = _.c(E.colTotal)-_.c(E.colLabel);
+  const offPct = _.c(E.colPct)-_.c(E.colLabel);
+
+  for (let i=0;i<Math.min(outH, sorted.length); i++){
+    const [cat,total] = sorted[i];
+    buf[i][0] = cat;
+    buf[i][offTotal] = total;
+    buf[i][offPct] = incomeAEP>0 ? total/incomeAEP : 0;
+  }
+
+  sh.getRange(E.rowStart, _.c(E.colLabel), outH, outW).setValues(buf);
+  
+  const filled = Math.min(outH,sorted.length);
+  if (filled > 0) {
+    sh.getRange(E.rowStart, _.c(E.colTotal), filled, 1).setNumberFormat(CFG.formats.money);
+    sh.getRange(E.rowStart, _.c(E.colPct), filled, 1).setNumberFormat(CFG.formats.percent1);
+  }
 }
 
-/* ============================= “TILES ONLY” REFRESH (fast path for onEdit) ============================= */
-function _updateTilesOnly(){
-  Monthly_UpdateBankAndCategoryFormatting(); // includes top tiles + categories
-}
+// ✅ NEW: Faster hi/lo tiles (reuses already-read data)
+function _updateHiLoTiles_Fast(sh, expData, idxCat, idxPred, idxAct, T){
+  let hiExpVal = 0, hiExpName = "";
+  let loExpVal = Number.POSITIVE_INFINITY, loExpName = "";
+  const catTotals = new Map();
+  let subsTotal = 0;
 
+  for (const row of expData){
+    const name = String(row[0] || "").trim();
+    if (!name) continue;
+
+    const cat = String(row[idxCat] || "").trim();
+    const pred = _.n(row[idxPred]);
+    const act = _.n(row[idxAct]);
+    const aep = (act > 0) ? act : pred;
+    if (aep <= 0) continue;
+
+    if (aep > hiExpVal){ hiExpVal = aep; hiExpName = name; }
+    if (aep < loExpVal){ loExpVal = aep; loExpName = name; }
+
+    if (cat){
+      catTotals.set(cat, (catTotals.get(cat) || 0) + aep);
+      if (cat === CFG.monthly.subscriptionsCategory) subsTotal += aep;
+    }
+  }
+
+  sh.getRange(T.hiExp).setValue(hiExpName || "")
+    .setNote(hiExpVal>0 ? ("Amount: $" + hiExpVal.toFixed(2)) : "");
+  sh.getRange(T.loExp).setValue((isFinite(loExpVal)&&loExpVal>0)?loExpName:"")
+    .setNote((isFinite(loExpVal)&&loExpVal>0)?("Amount: $" + loExpVal.toFixed(2)):"");
+  sh.getRange(T.subs).setValue(subsTotal).setNumberFormat(CFG.formats.money);
+}
 /* ============================= OPTIONAL: PUBLIC COMPOSER ============================= */
-function Monthly_UpdateAllTiles(){
-  Monthly_UpdateBankAndCategoryFormatting(); // bank + category table + top tiles
-}
-
 
 
 /* ============================= INCOME SHEET DASH (tiles) ============================= */
 function updateIncomeTiles(){
-  const ss=SpreadsheetApp.getActive(), sh=ss.getSheetByName(CFG.income.tiles.sheet);
-  if(!sh) return;
+  console.time("updateIncomeTiles");
+  const ss = __ss();;
+  const sh = ss.getSheetByName(CFG.income.tiles.sheet);
+  if (!sh) return;
 
-  const y=_.year();
-  const master=INCOME.readMaster();
-  const mSh=ss.getSheetByName(CFG.singleMonth.sheet);
+  const y = _.year();
+  const master = INCOME.readMaster();
+  const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
 
-  // Predicted annual (frequency-aware, start-date aware)
+  // Predicted annual (unchanged logic)
   let predAnnual = 0;
   for (const r of master){
     const F = _.normFreq(r.freq);
@@ -2764,38 +3792,52 @@ function updateIncomeTiles(){
     const perOcc = r.perFreq || 0;
     predAnnual += perOcc * occs.length;
   }
-  _.fmtMoney(sh.getRange(CFG.income.tiles.predictedAnnual)).setValue(predAnnual);
 
   const predictedMonthlyAvg = predAnnual / 12;
-  sh.getRange(CFG.income.tiles.predictedMonthlyAvg)
-    .setValue(predictedMonthlyAvg)
-    .setNumberFormat(CFG.formats.money);
 
   // This-month income AEP
-  const t=CFG.monthly.incomeTable;
+  const t = CFG.monthly.incomeTable;
   const thisMonthIncome = _.sumAEP_block(mSh, t.rowStart, t.rowEnd, t.colPred, t.colAct);
-  _.fmtMoney(sh.getRange(CFG.income.tiles.thisMonth)).setValue(thisMonthIncome);
 
-  // Variance (actual total - monthly avg)
-  const actuals = mSh.getRange(t.rowStart, _.c(t.colAct), t.rowEnd-t.rowStart+1, 1).getValues();
-  let actualMonthlyTotal = 0;
-  for (const row of actuals) { actualMonthlyTotal += _.n(row[0]); }
- const varCell = sh.getRange(CFG.income.tiles.incomeVariance);
-const variance = thisMonthIncome - predictedMonthlyAvg; // Use thisMonthIncome (already calculated above)
-if (Math.abs(variance) < 0.01) { varCell.clearContent(); }
-else { varCell.setValue(variance).setNumberFormat(CFG.formats.moneyNeg); }
+  // Variance
+  const variance = thisMonthIncome - predictedMonthlyAvg;
+
+  // Days left in month
+  const now = new Date();
+const { e:last } = monthBounds(now.getFullYear(), now.getMonth()+1);
+const daysLeft = Math.max(0, Math.ceil((last - now) / MS_DAY));
 
 
-
-  // Days left this month
-  const now=new Date(), last=new Date(now.getFullYear(), now.getMonth()+1, 0);
-  sh.getRange(CFG.income.tiles.daysLeft).setValue(Math.max(0, Math.ceil((last-now)/86400000))).setNumberFormat("0");
-
-  // Unbudgeted = thisMonthIncome - expenses AEP - savings AEP
+  // Unbudgeted = income - (expenses + savings)
   const expAEP = _.sumAEP_block(mSh, CFG.monthly.expenseTable.rowStart, CFG.monthly.expenseTable.rowEnd, CFG.monthly.expenseTable.colPred, CFG.monthly.expenseTable.colAct);
   const saveAEP = _.sumAEP_block(mSh, CFG.savings.monthly.rowStart, CFG.savings.monthly.rowEnd, CFG.savings.monthly.colPred, CFG.savings.monthly.colAct);
-  _.fmtMoney(sh.getRange(CFG.income.tiles.unbudgeted)).setValue(thisMonthIncome - expAEP - saveAEP);
+  const unbudgeted = thisMonthIncome - expAEP - saveAEP;
+
+  // ===== BATCH TILE WRITES =====
+  const tiles = [
+    [CFG.income.tiles.predictedAnnual,     predAnnual,          CFG.formats.money],
+    [CFG.income.tiles.predictedMonthlyAvg, predictedMonthlyAvg, CFG.formats.money],
+    [CFG.income.tiles.thisMonth,           thisMonthIncome,     CFG.formats.money],
+    [CFG.income.tiles.daysLeft,            daysLeft,            "0"],
+    [CFG.income.tiles.unbudgeted,          unbudgeted,          CFG.formats.money]
+  ];
+
+  // set all values first
+  tiles.forEach(([a1, val]) => sh.getRange(a1).setValue(val));
+  // then format in one pass
+  tiles.forEach(([a1, , fmt]) => sh.getRange(a1).setNumberFormat(fmt));
+
+  // Variance keeps your conditional behavior
+  const varCell = sh.getRange(CFG.income.tiles.incomeVariance);
+  if (Math.abs(variance) < 0.01) {
+    varCell.clearContent();
+  } else {
+    varCell.setValue(variance).setNumberFormat(CFG.formats.moneyNeg);
+  }
+
+  console.timeEnd("updateIncomeTiles");
 }
+
 function WarnDupes_WriteColumnH_Block(sh, rowStart, rowEnd, colName, warnColLtr){
   const warnCol = _.c(warnColLtr||"H");
   const n = rowEnd - rowStart + 1;
@@ -2817,7 +3859,7 @@ function WarnDupes_WriteColumnH_Block(sh, rowStart, rowEnd, colName, warnColLtr)
   }
 }
 function WarnDupes_UpdateAll(){
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
   const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
   if (mSh) WarnDupes_WriteColumnH_Block(mSh, CFG.bank.rowStart, CFG.bank.rowEnd, CFG.bank.colName, "H");
   const dSh = ss.getSheetByName(CFG.datedAccountBalance.sheet);
@@ -2840,87 +3882,112 @@ function Expenses_ComputePredictedAnnual(y) {
 }
 
 function Expenses_UpdateSheetTiles() {
-  const ss=SpreadsheetApp.getActive(), sheet=ss.getSheetByName(CFG.expenses.tiles.sheet); if (!sheet) return;
-  const mSh=ss.getSheetByName(CFG.singleMonth.sheet);
+   console.time("Expenses_UpdateSheetTiles");
+  const ss = __ss();;
+  const sheet = ss.getSheetByName(CFG.expenses.tiles.sheet); 
+  if (!sheet) return;
+  
+  const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
+  if (!mSh) return;
 
-  const monthTotal = mSh ? _.sumAEP_block(mSh, CFG.expenses.monthly.rowStart, CFG.expenses.monthly.rowEnd, CFG.expenses.monthly.colPred, CFG.expenses.monthly.colAct) : 0;
-  _.fmtMoney(sheet.getRange(CFG.expenses.tiles.totalMonthly)).setValue(monthTotal);
-
-  const y=_.year(), predictedAnnual = Expenses_ComputePredictedAnnual(y);
-  _.fmtMoney(sheet.getRange(CFG.expenses.tiles.predictedAnnual)).setValue(predictedAnnual);
-try {
-  const mSh = SpreadsheetApp.getActive().getSheetByName(CFG.singleMonth.sheet);
-  const monthM2  = _.n(mSh.getRange("M2").getValue());
+  // READ values directly from Month sheet (batched read)
+  const monthValues = mSh.getRange("M2:M10").getValues();
+  const monthM2 = _.n(monthValues[0][0]);
+  const monthM10 = _.n(monthValues[8][0]);
+  
   const monthH10 = _.n(mSh.getRange("H10").getValue());
-  const monthM10 = _.n(mSh.getRange("M10").getValue());
 
-  // Expenses sheet targets
-  const eSh = SpreadsheetApp.getActive().getSheetByName(CFG.expenses.tiles.sheet);
-  if (eSh) {
-    eSh.getRange("H2").setValue(monthM2).setNumberFormat(CFG.formats.money);        // total month spending
-    eSh.getRange("M2").setValue(monthM2 * 12).setNumberFormat(CFG.formats.money);   // predicted annual from M2
 
-    eSh.getRange("H6").setValue(monthH10).setNumberFormat(CFG.formats.money);       // all-out expenses w/ CC
-    eSh.getRange("M6").setValue(monthM10).setNumberFormat(CFG.formats.money);       // cc payments total
-  }
-} catch(_) {}
+  // Predicted annual
+  const y = _.year();
+  const predictedAnnual = Expenses_ComputePredictedAnnual(y);
 
+  sheet.getRangeList(["H2","M2","H6","M6"])
+  .getRanges()
+  .forEach((rng, i) => {
+    const v = [monthM2, monthM2 * 12, monthH10, monthM10][i];
+    rng.setValue(v);
+  });
+sheet.getRangeList(["H2","M2","H6","M6"])
+  .getRanges()
+  .forEach(rng => rng.setNumberFormat(CFG.formats.money));
+
+  
+  sheet.getRange(CFG.expenses.tiles.predictedAnnual).setValue(predictedAnnual).setNumberFormat(CFG.formats.money);
+
+  // Upcoming expenses, largest day, etc.
   updateExpenseExtras();
-}
+  
+    console.timeEnd("Expenses_UpdateSheetTiles");
 
+}
 function updateExpenseExtras(){
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
   const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
   const sheet = ss.getSheetByName(CFG.expenses.tiles.sheet);
   if (!mSh || !sheet) return;
 
+  const CT = CFG.expenses.categoryTiles;
   const now = new Date();
   const currentY = now.getFullYear();
   const currentM = now.getMonth() + 1;
 
   const t = CFG.expenses.monthly;
-  const data = mSh
-    .getRange(t.rowStart, _.c(t.colName), t.rowEnd - t.rowStart + 1, _.c(t.colAcct) - _.c(t.colName) + 1)
-    .getValues();
+  
+  // OPTIMIZATION: Read all columns at once (instead of calculating width)
+  const dataRange = mSh.getRange(t.rowStart, _.c(t.colName), t.rowEnd - t.rowStart + 1, _.c(t.colAcct) - _.c(t.colName) + 1);
+  const data = dataRange.getValues();
 
   const idxDate = _.c(t.colDate) - _.c(t.colName);
-  const idxCat  = _.c(t.colCat)  - _.c(t.colName);
+  const idxCat = _.c(t.colCat) - _.c(t.colName);
   const idxPred = _.c(t.colPred) - _.c(t.colName);
-  const idxAct  = _.c(t.colAct)  - _.c(t.colName);
+  const idxAct = _.c(t.colAct) - _.c(t.colName);
 
-  // Upcoming (>= today) – top 2 by date
+  // Pre-filter: Skip empty rows (HUGE speedup!)
+  const validRows = data.filter(r => String(r[0] || "").trim() !== "");
+
+  // Upcoming expenses
+  const upcoming = [];
+  for (const r of validRows){
+    const nm = String(r[0] || "").trim();
+    const d = _.toDate(r[idxDate]);
+    if (!d || d < now) continue;
+    
+    const days = Math.ceil((d.setHours(0,0,0,0) - (new Date()).setHours(0,0,0,0)) / 86400000);
+    upcoming.push({ nm, d: new Date(d), days });
+  }
+  
+  upcoming.sort((a,b) => a.d - b.d);
+
+  // Batch write upcoming expenses
   const up1 = sheet.getRange(CFG.expenses.tiles.upcomingExpense1);
   const up2 = sheet.getRange(CFG.expenses.tiles.upcomingExpense2);
-  up1.clearContent().setNote(""); 
-  up2.clearContent().setNote("");
-
-  const upcoming = [];
-  for (const r of data){
-    const nm = String(r[0] || "").trim(); if (!nm) continue;
-    const d  = _.toDate(r[idxDate]);        if (!d)  continue;
-    if (d >= now){
-      const days = Math.ceil((d.setHours(0,0,0,0) - (new Date()).setHours(0,0,0,0)) / 86400000);
-      upcoming.push({ nm, d: new Date(d), days });
-    }
+  
+  if (upcoming[0]) {
+    up1.setValue(upcoming[0].nm).setNote(upcoming[0].days + " days");
+  } else {
+    up1.clearContent().setNote("");
   }
-  upcoming.sort((a,b)=>a.d - b.d);
-  if (upcoming[0]) up1.setValue(upcoming[0].nm).setNote(upcoming[0].days + " days");
-  if (upcoming[1]) up2.setValue(upcoming[1].nm).setNote(upcoming[1].days + " days");
+  
+  if (upcoming[1]) {
+    up2.setValue(upcoming[1].nm).setNote(upcoming[1].days + " days");
+  } else {
+    up2.clearContent().setNote("");
+  }
 
   // Largest day - CURRENT MONTH ONLY
   const perDay = new Map();
-  for (const r of data){
-    const d = _.toDate(r[idxDate]); 
-    if (!d) continue;
+  for (const r of validRows){
+    const d = _.toDate(r[idxDate]);
+    if (!d || d.getFullYear() !== currentY || (d.getMonth() + 1) !== currentM) continue;
     
-    // CRITICAL: Filter to current month
-    if (d.getFullYear() !== currentY || (d.getMonth() + 1) !== currentM) continue;
-    
-    const amt = Math.max(_.n(r[idxAct]), _.n(r[idxPred])); 
-    if (amt <= 0) continue;
+ const act  = +r[idxAct]  || 0;
+const pred = +r[idxPred] || 0;
+const aep = act > 0 ? act : pred;
+if (aep <= 0) continue;
     
     const key = d.toISOString().slice(0,10);
-    perDay.set(key, (perDay.get(key) || 0) + amt);
+    perDay.set(key, (perDay.get(key) || 0) + aep);
   }
   
   let bestKey = "", bestAmt = 0;
@@ -2932,57 +3999,41 @@ function updateExpenseExtras(){
   }
   
   const AB2 = sheet.getRange(CFG.expenses.tiles.largestDay);
-  AB2.clearContent().clearNote();  // CLEAR FIRST
   if (bestKey){
-    const d = new Date(bestKey + "T12:00:00");  // Force noon to avoid timezone issues
-    const displayText = d.toLocaleString('en-US', {month:'short'}) + " " + d.getDate();
+    const d = new Date(bestKey + "T12:00:00");
+const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const displayText = MON[d.getMonth()] + " " + d.getDate();
     AB2.setValue(displayText).setNote("$" + bestAmt.toFixed(2));
+  } else {
+    AB2.clearContent().clearNote();
   }
 
-  // Category & item rollups (+ subscriptions)
+  // Category & item rollups
   const catTotals = new Map();
   const nameTotals = new Map();
   let subsTotal = 0;
 
-  for (const r of data){
-    const nm  = String(r[0] || "").trim();
+  for (const r of validRows){
+    const nm = String(r[0] || "").trim();
     const cat = String(r[idxCat] || "").trim();
-    const amt = Math.max(_.n(r[idxAct]), _.n(r[idxPred]));
-    if (!nm || amt <= 0) continue;
-    nameTotals.set(nm, (nameTotals.get(nm) || 0) + amt);
-    if (cat){
-      catTotals.set(cat, (catTotals.get(cat) || 0) + amt);
-      if (cat === CFG.monthly.subscriptionsCategory) subsTotal += amt;
+const act  = +r[idxAct]  || 0;
+const pred = +r[idxPred] || 0;
+const aep = act > 0 ? act : pred;
+if (aep <= 0) continue;
+    
+nameTotals.set(nm, (nameTotals.get(nm) || 0) + aep);   
+if (cat){
+     catTotals.set(cat, (catTotals.get(cat) || 0) + aep);
+      if (cat === CFG.monthly.subscriptionsCategory) subsTotal += aep;
     }
   }
 
-  const incomeTotal = _.sumAEP_block(
-    mSh, CFG.monthly.incomeTable.rowStart, CFG.monthly.incomeTable.rowEnd,
-    CFG.monthly.incomeTable.colPred, CFG.monthly.incomeTable.colAct
-  );
-
-  const CT = CFG.expenses.categoryTiles;
-  if (catTotals.size){
-    const sorted = [...catTotals.entries()].sort((a,b)=>b[1]-a[1]);
-    const [hiName, hiAmt] = sorted[0];
-    const low = sorted.filter(([,v])=>v>0).slice(-1)[0] || ["—",0];
-
-    sheet.getRange(CT.highestCatName)
-      .setValue((hiName||"").split(/\s+/)[0])
-      .setNote("$" + hiAmt.toFixed(2) + (incomeTotal>0 ? (" (" + (hiAmt/incomeTotal*100).toFixed(1) + "%)") : ""));
-
-    sheet.getRange(CT.lowestCatName)
-      .setValue((low[0]||"—").split(/\s+/)[0])
-      .setNote(low[1]>0?`$${low[1].toFixed(2)}${incomeTotal>0?` (${(low[1]/incomeTotal*100).toFixed(1)}%)`:""}`:"No non-zero category");
-  } else {
-    sheet.getRange(CT.highestCatName).setValue("—").setNote("");
-    sheet.getRange(CT.lowestCatName).setValue("—").setNote("");
-  }
-
+  // Write category tiles
   if (nameTotals.size){
-    const items = [...nameTotals.entries()].sort((a,b)=>b[1]-a[1]);
+    const items = [...nameTotals.entries()].sort((a,b) => b[1] - a[1]);
     const [hiName, hiAmt] = items[0];
-    const [loName, loAmt] = items[items.length-1];
+    const [loName, loAmt] = items[items.length - 1];
+    
     sheet.getRange(CT.highestExpName).setValue(hiName).setNote(`$${hiAmt.toFixed(2)}`);
     sheet.getRange(CT.lowestExpName).setValue(loName).setNote(`$${loAmt.toFixed(2)}`);
   } else {
@@ -2995,7 +4046,7 @@ function updateExpenseExtras(){
 
 /* ============================= CATEGORY TABLE (MONTH) (alt composer) ============================= */
 function Expenses_UpdateCategories(){
-  const ss=SpreadsheetApp.getActive(), E=CFG.monthly.categoryTable, sh=ss.getSheetByName(CFG.singleMonth.sheet);
+ const ss = __ss(); E=CFG.monthly.categoryTable, sh=ss.getSheetByName(CFG.singleMonth.sheet);
   if (!sh) return;
 
   const incomeTotal = _.sumAEP_block(sh, CFG.monthly.incomeTable.rowStart, CFG.monthly.incomeTable.rowEnd, CFG.monthly.incomeTable.colPred, CFG.monthly.incomeTable.colAct);
@@ -3031,10 +4082,31 @@ function Expenses_UpdateCategories(){
     _.fmtPct(  sh.getRange(E.rowStart, _.c(E.colPct),   filled, 1));
   }
 }
+function _ensureCalendarProtection_(sh, startRow, leftCol, height, width){
+  const range = sh.getRange(startRow, leftCol, height, width);
+  const a1 = range.getA1Notation();
+  const prot = sh.getProtections(SpreadsheetApp.ProtectionType.RANGE);
+  if (prot.some(p => p.getRange().getA1Notation() === a1)) return;
+  const p = range.protect();
+  p.setDescription("Calendar (auto-generated)");
+  p.setWarningOnly(true);
+}
+
+function _buildAcctByNameFromIncomeMaster_(){
+  const master = (typeof INCOME!=='undefined' && INCOME.readMaster) ? INCOME.readMaster() : [];
+  const map = new Map();
+  for (const r of master){
+    const nm = String(r.name||"").trim();
+    const acct = String(r.acct||"").trim();
+    if (nm && acct) map.set(nm, acct);
+  }
+  return map;
+}
+
 
 /* ============================= SINGLE-MONTH ROLLOVER HELPERS ============================= */
 function SingleMonth_EnsureSheet(){
-  const ss=SpreadsheetApp.getActive(), name=CFG.singleMonth.sheet;
+ const ss = __ss(); name=CFG.singleMonth.sheet;
   let sh=ss.getSheetByName(name); if (!sh){ sh=ss.insertSheet(name, 0); }
   return sh;
 }
@@ -3066,10 +4138,14 @@ function SingleMonth_CarryBankBegins_FromPrevEnd(sh){
   const n = B.rowEnd - B.rowStart + 1;
 
   // Only clear totals; leave Pred Begin (L) alone
-  const colsToClear = [B.colExpTotal, B.colIncomeTotal, B.colTransfer, B.colPredEnd, B.colActEnd];
-  for (const col of colsToClear){
-    sh.getRange(B.rowStart, _.c(col), n, 1).clearContent();
-  }
+ sh.getRangeList([
+  `${B.colExpTotal}${B.rowStart}:${B.colExpTotal}${B.rowEnd}`,
+  `${B.colIncomeTotal}${B.rowStart}:${B.colIncomeTotal}${B.rowEnd}`,
+  `${B.colTransfer}${B.rowStart}:${B.colTransfer}${B.rowEnd}`,
+  `${B.colPredEnd}${B.rowStart}:${B.colPredEnd}${B.rowEnd}`,
+  `${B.colActEnd}${B.rowStart}:${B.colActEnd}${B.rowEnd}`
+]).clearContent();
+
 }
 
 /* ============================= MISC HEADER + BOUNDS ============================= */
@@ -3095,59 +4171,70 @@ function getCurrentMonthBounds() {
 
 /* ============================= MAIN ORCHESTRATOR ============================= */
 function updateAll(){
-  const ss=SpreadsheetApp.getActive();
-  const sh=ss.getSheetByName(CFG.singleMonth.sheet) || ss.insertSheet(CFG.singleMonth.sheet);
-  const y=_.year(), mIdx=_.monthIdx();
-
-  // Rebuild paychecks ONCE
-  try { PAYCHECKS.rebuild(); } catch(_) {}
-
-  const incomeMaster=INCOME.readMaster();
-  const expenseMaster=EXPENSES.readMaster();
-  const savingsMaster=SAVINGS.readMain();
-
-  // Populate Month tables
-  INCOME.populateMonth(sh, y, mIdx, true, incomeMaster);
-  EXPENSES.populateMonth(sh, y, mIdx, true, expenseMaster);
-  SAVINGS.populateMonth(sh, y, mIdx, true, savingsMaster);
-
-  // === FIX: Recalculate savings percent AFTER populating ===
-  try { Savings_RecomputeMonthFromMonthOnly(); } catch(_) {}
-  
-  // === FIX: Update emergency fund tile ===
-  try { Savings_UpdateEmergencyFundTile(); } catch(_) {}
-
-  // Update Month visuals (calendar + tiles)
-  Monthly_UpdateAllTiles();
-
-  // Update Savings (main table + tiles)
-  const savingsSh = ss.getSheetByName(CFG.savings.sheet);
-  if (savingsSh) {
-    SAVINGS.recomputeMain(savingsSh, savingsMaster);
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(0)) {
+    Logger.log("updateAll skipped: lock busy");
+    return;
   }
-
-  // Update other dashboards
-  updateIncomeTiles();
-  Expenses_UpdateSheetTiles();
-
-  // Dated AB - only if date is set
   try {
-    const dSh = ss.getSheetByName(CFG.datedAccountBalance.sheet);
-    if (dSh) {
-      const targetDate = _.toDate(dSh.getRange(CFG.datedAccountBalance.targetDate).getValue());
-      if (targetDate) {
-        DATED_ACCOUNT_BALANCE.refreshSourceData(false);
-        DATED_ACCOUNT_BALANCE.updateDatedAccountBalance();
-      }
+    const totalStart = new Date();
+    Logger.log("=== updateAll START ===");
+    CALL_TRACKER.updateAll++;
+    console.time("updateAll");
+
+const ss = __ss();
+    const sh = ss.getSheetByName(CFG.singleMonth.sheet) || ss.insertSheet(CFG.singleMonth.sheet);
+    const y = _.year(), mIdx = _.monthIdx();
+
+    try { PAYCHECKS.rebuild(); } catch(_){}
+    const incomeMaster = INCOME.readMaster();
+    const expenseMaster = EXPENSES.readMaster();
+    const savingsMaster = SAVINGS.readMain();
+
+    INCOME.populateMonth(sh, y, mIdx, true, incomeMaster);
+    EXPENSES.populateMonth(sh, y, mIdx, true, expenseMaster);
+    SAVINGS.populateMonth(sh, y, mIdx, true, savingsMaster);
+
+    console.time("Savings_RecomputeMonthFromMonthOnly");
+    try { Savings_RecomputeMonthFromMonthOnly(); } catch(e){ Logger.log(e); }
+    console.timeEnd("Savings_RecomputeMonthFromMonthOnly");
+
+    console.time("Savings_UpdateEmergencyFundTile");
+    try { Savings_UpdateEmergencyFundTile(); } catch(e){ Logger.log(e); }
+    console.timeEnd("Savings_UpdateEmergencyFundTile");
+
+    const savingsSh = ss.getSheetByName(CFG.savings.sheet);
+    if (savingsSh){
+      console.time("SAVINGS.recomputeMain");
+      try { SAVINGS.recomputeMain(savingsSh, savingsMaster); } catch(e){ Logger.log(e); }
+      console.timeEnd("SAVINGS.recomputeMain");
     }
-  } catch(_){}
-}
-/* ===== CREDIT CARDS ===== */
-(function ensureCCcfg(){
-  if (!CFG.creditCards) {
-    CFG.creditCards = { bankMarkCol: "O", paymentCategory: "Credit Card Payment" };
+
+    try { Monthly_UpdateBankAndCategoryFormatting(); } catch(e){ Logger.log("Bank error: " + e); }
+
+    try { updateIncomeTiles && updateIncomeTiles(); } catch(e){ Logger.log(e); }
+    try { Expenses_UpdateSheetTiles && Expenses_UpdateSheetTiles(); } catch(e){ Logger.log(e); }
+
+    try {
+      const dSh = ss.getSheetByName(CFG.datedAccountBalance.sheet);
+      if (dSh) {
+        const targetDate = _.toDate(dSh.getRange(CFG.datedAccountBalance.targetDate).getValue());
+        if (targetDate) {
+          DATED_ACCOUNT_BALANCE.refreshSourceData(false); // includes updateDatedAccountBalance
+        }
+      }
+    } catch(e){ Logger.log("Dated AB error: " + e); }
+
+    if (savingsSh){
+      try { SAVINGS.recomputeTiles(savingsSh, savingsMaster); } catch(e){ Logger.log(e); }
+    }
+
+    console.timeEnd("updateAll");
+    Logger.log("=== updateAll END === " + ((new Date()-totalStart)/1000) + "s");
+  } finally {
+    lock.releaseLock();
   }
-})();
+}
 
 function CreditCards_EnsureBankCheckboxes(){
   const sh = SpreadsheetApp.getActive().getSheetByName(CFG.singleMonth.sheet);
@@ -3155,12 +4242,11 @@ function CreditCards_EnsureBankCheckboxes(){
   const B = CFG.bank, markCol = CFG.creditCards.bankMarkCol || "O";
   const rows = B.rowEnd - B.rowStart + 1;
   const rng = sh.getRange(B.rowStart, _.c(markCol), rows, 1);
-  rng.insertCheckboxes();
   rng.setHorizontalAlignment("center").setVerticalAlignment("middle");
 }
 
 function _CC_computeExpenseSplits_(){
-  const ss = SpreadsheetApp.getActive(), mSh = ss.getSheetByName(CFG.singleMonth.sheet); 
+ const ss = __ss(); mSh = ss.getSheetByName(CFG.singleMonth.sheet); 
   if(!mSh) return {chargesByAcct:new Map(), paymentsByAcct:new Map()};
   const t = CFG.monthly.expenseTable;
   const width = _.c(t.colAcct)-_.c(t.colName)+1;
@@ -3189,20 +4275,12 @@ function CreditCards_Enable(){
   try{ Monthly_UpdateBankAndCategoryFormatting(); }catch(_){} 
 }
 
-/* Optional debug helpers */
-function DebugCreditCardMath(){
-  try {
-    const res = _CC_computeExpenseSplits_();
-    Logger.log(res);
-    SpreadsheetApp.getActive().toast("Logged: CC splits → View > Logs", "Debug", 4);
-  } catch(e){ Logger.log(e); }
-}
 
 /* ============================= ACTUALS → MONTH ============================= */
 /* Income: sum dated-income Actuals (Include=TRUE) for the current month by Name,
    write totals to the Month Income table's Actual column (match by Name). */
 function Actuals_WriteToMonthIncome(){
-  const ss  = SpreadsheetApp.getActive();
+const ss = __ss();
   const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
   const dSh = ss.getSheetByName(CFG.datedAccountBalance.sheet);
   if (!mSh || !dSh) return;
@@ -3217,11 +4295,11 @@ function Actuals_WriteToMonthIncome(){
   const idxName = 0;
   const idxDate = _.c(DI.colDate)   - _.c(DI.colName);
   const idxAct  = _.c(DI.colAct)    - _.c(DI.colName);
-  const idxInc  = _.c(DI.colInclude)- _.c(DI.colName);
+const idxInc  = _.c(DI.colInclude)- _.c(DI.colName);
 
   const byName = new Map();
   for (const r of data){
-    const inc = (r[idxInc]===true) || (String(r[idxInc]).toUpperCase()==="TRUE") || (r[idxInc]===1);
+const inc = _boolCell_(r[idxInc]);
     if (!inc) continue;
     const nm = String(r[idxName]||"").trim(); if (!nm) continue;
     const d  = _.toDate(r[idxDate]);          if (!d || d.getFullYear()!==y || (d.getMonth()+1)!==m) continue;
@@ -3248,32 +4326,38 @@ function Actuals_WriteToMonthIncome(){
    write totals to the Month Expense table's Actual column (match by Name).
    Interprets “total of all frequencies” as “sum of all dated occurrences this month.” */
 function Actuals_WriteToMonthExpenses(){
-  const ss  = SpreadsheetApp.getActive();
+  const ss = __ss();
   const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
   const dSh = ss.getSheetByName(CFG.datedAccountBalance.sheet);
   if (!mSh || !dSh) return;
 
   const y = _.year(), m = _.monthIdx();
-  const D  = CFG.datedAccountBalance;
-  const E  = D.expenses;
+  const E  = CFG.datedAccountBalance.expenses;
 
   const rows  = E.rowEnd - E.rowStart + 1;
   const width = _.c(E.colInclude) - _.c(E.colName) + 1;
   const data  = dSh.getRange(E.rowStart, _.c(E.colName), rows, width).getValues();
 
-  const idxName = 0;
-  const idxDate = _.c(E.colDate)    - _.c(E.colName);
-  const idxAmt  = _.c(E.colAmount)  - _.c(E.colName);
-  const idxInc  = _.c(E.colInclude) - _.c(E.colName);
+  const iName = 0;
+  const iDate = _.c(E.colDate)    - _.c(E.colName);
+  const iPred = _.c(E.colPred)    - _.c(E.colName);
+  const iAct  = _.c(E.colAct)     - _.c(E.colName);
+  const iInc  = _.c(E.colInclude) - _.c(E.colName);
 
   const byName = new Map();
   for (const r of data){
-    const inc = (r[idxInc]===true) || (String(r[idxInc]).toUpperCase()==="TRUE") || (r[idxInc]===1);
+const inc = _boolCell_(r[idxInc]);
     if (!inc) continue;
-    const nm = String(r[idxName]||"").trim(); if (!nm) continue;
-    const d  = _.toDate(r[idxDate]);          if (!d || d.getFullYear()!==y || (d.getMonth()+1)!==m) continue;
-    const a  = _.n(r[idxAmt]); if (!(a>0)) continue;
-    byName.set(nm, (byName.get(nm)||0) + a);
+    const nm = String(r[iName]||"").trim(); if (!nm) continue;
+    const d  = _.toDate(r[iDate]);          if (!d || d.getFullYear()!==y || (d.getMonth()+1)!==m) continue;
+
+  const act  = +r[iAct]  || 0;
+const pred = +r[iPred] || 0;
+const aep = act > 0 ? act : pred;
+if (aep <= 0) continue;
+
+
+    byName.set(nm, (byName.get(nm)||0) + aep);
   }
 
   const MT = CFG.monthly.expenseTable;
@@ -3291,6 +4375,7 @@ function Actuals_WriteToMonthExpenses(){
   _.fmtMoney(outRng);
 }
 
+
 /* One-click writer + refresh tiles/bank/category */
 function WriteActualsToMonth_All(){
   try { Actuals_WriteToMonthIncome(); } catch(e){ Logger.log(e); }
@@ -3307,7 +4392,7 @@ function WriteActualsToMonth_All(){
 /* Minimal Reset: clears Month Actuals only (Income/Expenses/Savings).
    If you already have Reset_All(), keep yours; else this is a safe default. */
 function Reset_All(){
-  const ss = SpreadsheetApp.getActive();
+  const ss = __ss();;
   const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
   if (mSh){
     const I = CFG.monthly.incomeTable;
@@ -3329,165 +4414,133 @@ function Reset_All(){
 
 
 function onOpen(){
-  const ss = SpreadsheetApp.getActive();
+  const totalStart = Date.now();
+  Logger.log("=== onOpen START ===");
 
+  const ss = __ss();
   const sh = SingleMonth_EnsureSheet();
+
+  // Month rollover once per calendar month
   const now = new Date();
   const ym = STATE.ymStr(now.getFullYear(), now.getMonth()+1);
   const last = STATE.get(STATE.KEY_LAST_YM);
-  
-  // === MONTH ROLLOVER CHECK ===
   if (last !== ym) { 
+    console.time("Rollover");
     SingleMonth_ClearMonthlyRows(sh); 
     SingleMonth_CarryBankBegins_FromPrevEnd(sh); 
+    console.timeEnd("Rollover");
   }
   STATE.set(STATE.KEY_LAST_YM, ym);
 
-  // === WRITE MONTH HEADER ===
+  // UI bits (menus must be rebuilt each open)
+  console.time("UI setup");
   try { Month_WriteHeader(); } catch(_){}
-
-  try { 
-    Lists_AddCategory("Credit Card Payment");  // Force add first
-  } catch(_){}
-
-
-
-  // === CREATE MENU ===
+  try { Lists_AddCategory("Credit Card Payment"); } catch(_){}
   try { createBudgetToolsMenu(); } catch(_){}
+  console.timeEnd("UI setup");
 
-  // === UPDATE ALL SHEETS ===
+  // Toast while we compute
+  ss.toast("Updating budget data...", "Budget Tracker", -1);
+
+  // Heavy work
+  console.time("updateAll");
   updateAll();
-  try { Lists_ApplyValidations(); } catch(_) {}
+  console.timeEnd("updateAll");
 
+  // Validations (keep if cheap; else move to onEdit of lists)
+  console.time("Validations");
+  try { Lists_ApplyValidations(); } catch(_) {}
+  console.timeEnd("Validations");
+
+  ss.toast("Done!", "Budget Tracker", 1);
+
+  Logger.log("=== onOpen END === " + ((Date.now() - totalStart)/1000).toFixed(3) + "s");
 }
 
-
-
 function onSelectionChange(e) {
-  if (!e || !e.range) return;
+if (!e || !e.range) return;
+
+  const props = PropertiesService.getDocumentProperties();
+const last = Number(props.getProperty("__debounce_onSelection_ms") || "0");
+  const now = Date.now();
+  if (now - last < 250) return; // 250ms debounce window
+props.setProperty("__debounce_onSelection_ms", String(now));
 
   try {
-    const range = e.range;
-    const sh = range.getSheet();
+    const sh = e.range.getSheet();
     const sheetName = sh.getName();
+    const range = e.range;
     const row = range.getRow();
     const col = range.getColumn();
     
+    const topLeftCell = sh.getRange(row, col);
+    const cellA1 = topLeftCell.getA1Notation();
+    const value = range.getValue();
     
-    // === DATED H2 ===
+    // === AUTOMATIC "+N more" EXPANSION ===
+    if (sheetName === CFG.singleMonth.sheet && value) {
+      const str = String(value).trim();
+      
+      if (str.match(/^\+\d+\s+more$/i)) {
+        const key = "CAL_OVERFLOW_" + cellA1;
+const json = PropertiesService.getDocumentProperties().getProperty(key);
+        
+        if (json) {
+          const data = JSON.parse(json);
+          const { y, m, day, items } = data;
+          const msg = `📅 ${items.length} expenses on ${m}/${day}/${y}:\n\n` +
+            items.map((it, i) => `${i+1}. ${it.name} - $${Number(it.amount||0).toFixed(2)}`).join("\n");
+          SpreadsheetApp.getUi().alert(msg);
+          return;
+        }
+      }
+    }
+    
+    // === DATED H2 - Only trigger when SELECTING, not editing ===
+    // (Editing is handled by onEdit)
     if (sheetName === "Dated Account Balance" && cellA1 === "H2") {
       const d = _.toDate(sh.getRange("H2").getValue());
       if (!d) return;
 
       const stamp = Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
       const last = STATE.get("H2_LAST");
-      if (stamp === last) return;
+      if (stamp === last) return;  // Date hasn't changed, don't refresh
 
       STATE.set("H2_LAST", stamp);
       sh.getRange("K2").setValue("Updating...");
       SpreadsheetApp.flush();
+      
+      // Use FALSE because user is just SELECTING, not editing
+      // If they edit, onEdit will handle it with TRUE
       DATED_ACCOUNT_BALANCE.refreshSourceData(false);
+      
       sh.getRange("K2").clearContent();
       return;
     }
-
-    // === CALENDAR OVERFLOW ===
-    if (sheetName !== "Month") return;
-
-    const C = CFG.monthly.calendar;
-    const calLeft = _.c("C");
-    const calRight = _.c("AJ");
-    const calTop = C.startRow;
-    const calBottom = calTop + (C.perDayHeight * 6) - 1;
-
-    const RAB = _panelRect("AB");
-    const RAG = _panelRect("AG");
-
-    if (cellA1 === RAB.headerA1) {
-      const raw = STATE.get("OV_PANEL_AB");
-      if (raw) {
-        const p = JSON.parse(raw);
-        _renderPanel("AB", p.y, p.m, p.day, p.items);
-      }
-      return;
-    }
-
-    if (cellA1 === RAG.headerA1) {
-      const raw = STATE.get("OV_PANEL_AG");
-      if (raw) {
-        const p = JSON.parse(raw);
-        _renderPanel("AG", p.y, p.m, p.day, p.items);
-      }
-      return;
-    }
-
-    const contentH = 6;
-    const inAB = row >= RAB.rowStart && row <= RAB.rowEnd && col >= RAB.left && col < (RAB.left + RAB.width);
-    const inAG = row >= RAG.rowStart && row <= RAG.rowEnd && col >= RAG.left && col < (RAG.left + RAG.width);
-    if (inAB || inAG) return;
-
-    if (row < calTop || row > calBottom || col < calLeft || col > calRight) {
-      clearOverflowPanels();
-      return;
-    }
-
-    const weekIdx = Math.floor((row - C.startRow) / C.perDayHeight);
-    if (weekIdx < 0 || weekIdx > 5) { clearOverflowPanels(); return; }
-
-    const dayTop = C.startRow + weekIdx * C.perDayHeight;
-    const plusRow = dayTop + (contentH - 1);
-    if (row !== plusRow) { clearOverflowPanels(); return; }
-
-    const colLtr = cellA1.replace(/\d+/g, "");
-    const dgi = _groupIndexForCol(colLtr);
-    if (dgi < 0) { clearOverflowPanels(); return; }
-
-    const [cStart] = C.dayColGroups[dgi];
-    const firstCol = _.c(cStart);
-    const cellValue = String(sh.getRange(plusRow, firstCol).getValue() || "").trim();
-    if (!/^\+\d+\s+more$/.test(cellValue)) { clearOverflowPanels(); return; }
-
-    const y = _.year();
-    const m = _.monthIdx();
-    const firstDow = new Date(y, m - 1, 1).getDay();
-    const idx = weekIdx * 7 + dgi;
-    const dayNum = 1 + idx - firstDow;
-    const dim = new Date(y, m, 0).getDate();
-    if (dayNum < 1 || dayNum > dim) { clearOverflowPanels(); return; }
-
-    const occExp = EXPENSES.computeOccurrences(EXPENSES.readMaster(), y, m)
-      .filter(o => o.date.getDate() === dayNum)
-      .map(o => ({ name: o.name, amount: o.amt }));
-
-    const occXfer = TRANSFERS.readAndExpandForMonth(y, m)
-      .filter(t => t.date.getDate() === dayNum)
-      .map(t => ({ name: `Transfer: ${t.name}`, amount: t.amount }));
-
-    const items = occExp.concat(occXfer).sort((a, b) => b.amount - a.amount);
-    const visN = C.visibleLines || 4;
-    if (items.length <= visN) { clearOverflowPanels(); return; }
-
-    const side = (dgi >= 4) ? "AG" : "AB";
-    _renderPanel(side, y, m, dayNum, items);
     
   } catch(err) {
-    Logger.log("onSelectionChange ERROR: " + err);
   }
 }
- function onEdit(e){
+
+function onEdit(e){
   if (!e || !e.range) return;
 
-  const sh = e.range.getSheet();
-  const name = sh.getName();
-  const row = e.range.getRow();
-  const col = e.range.getColumn();
-  const a1  = e.range.getA1Notation();
-  const val = e.value;
+  // --- ultra-light debounce so rapid keystrokes don’t re-run logic
+  const props = PropertiesService.getDocumentProperties();
+  const last = Number(props.getProperty("__debounce_onEdit_ms") || "0");
+  const now = Date.now();
+  if (now - last < 250) return;
+  props.setProperty("__debounce_onEdit_ms", String(now));
 
-  // Make D available everywhere in this handler
+  const sh   = e.range.getSheet();
+  const name = sh.getName();
+  const row  = e.range.getRow();
+  const col  = e.range.getColumn();
+  const val  = e.value;
+
   const D = CFG.datedAccountBalance;
 
-  // === Live add new values to lists
+  // ========== 1) Live add to _Lists + bust transfer cache if TP changed ==========
   (function maybeAdd(){
     const v = String(val||"").trim(); if (!v) return;
     function inCol(L){ return col === _.c(L); }
@@ -3500,10 +4553,6 @@ function onSelectionChange(e) {
       if (inRows(B.rowStart,B.rowEnd) && inCol(B.colName)) return void Lists_AddAccount(v);
       if (inRows(E.rowStart,E.rowEnd) && inCol(E.colCat))  return void Lists_AddCategory(v);
     }
-if (e && e.range && e.range.getSheet().getName() === "_Lists") {
-  try { Lists_ApplyValidations(); } catch(err) { Logger.log("Validation update failed: " + err); }
-  return;
-}
 
     if (name === D.sheet){
       if (inRows(D.accounts.rowStart,D.accounts.rowEnd) && inCol(D.accounts.colName)) return void Lists_AddAccount(v);
@@ -3518,9 +4567,15 @@ if (e && e.range && e.range.getSheet().getName() === "_Lists") {
       if (inRows(TP.rowStart,TP.rowEnd) && inCol(TP.colName)) return void Lists_AddTransferName(v);
     }
 
+    // invalidate current-month expanded transfers (both our helper and CacheService)
+    try { _cacheDel_(`xfer:${_.year()}:${_.monthIdx()}`); } catch(_) {}
+    try { CacheService.getDocumentCache().remove(`xfer:${_.year()}:${_.monthIdx()}`); } catch(_) {}
+
     if (name === CFG.income.master.sheet){
       const M=CFG.income.master;
       if (inRows(M.rowStart,M.rowEnd) && inCol(M.colAcct)) return void Lists_AddAccount(v);
+      // paycheck cache bust (year list)
+      try { CacheService.getDocumentCache().remove("paychecks:" + _.year()); } catch(_){}
     }
 
     if (name === CFG.expenses.master.sheet){
@@ -3530,167 +4585,158 @@ if (e && e.range && e.range.getSheet().getName() === "_Lists") {
       if (inRows(M.rowStart,M.rowEnd) && inCol(M.colCat))  return void Lists_AddCategory(v);
     }
 
+    // cheap live refresh for Month
     try { Monthly_UpdateBankAndCategoryFormatting(); } catch(_){}
   })();
 
-  // === Savings MONTH table – early, lightweight
-  if (name === CFG.singleMonth.sheet){
-    const M = CFG.savings.monthly;
-    if (row >= M.rowStart && row <= M.rowEnd) {
-      try { Savings_RecomputeMonthFromMonthOnly(); } catch(err) { Logger.log("Savings error: " + err); }
-    }
+  // ========== 2) _Lists sheet → just re-apply validations ==========
+  if (name === "_Lists") {
+    try { Lists_ApplyValidations(); } catch(err) { Logger.log("Validation update failed: " + err); }
+    return;
   }
 
-  // === Savings MASTER sheet – recompute on edits to key cols
+  // ========== 3) Savings MASTER sheet ==========
   if (name === CFG.savings.sheet){
     const T = CFG.savings.table;
     if (row >= T.rowStart && row <= T.rowEnd) {
       const editCols = [ _.c(T.colStartAmount), _.c(T.colGoalAmount), _.c(T.colStartDate), _.c(T.colContribution), _.c(T.colFreq) ];
       if (editCols.includes(col)) {
-        const ss = SpreadsheetApp.getActive();
-        const savingsSh = ss.getSheetByName(CFG.savings.sheet);
+        SpreadsheetApp.flush();
+        const ssLoc = __ss();
+        const savingsSh = ssLoc.getSheetByName(CFG.savings.sheet);
         const mainRows = SAVINGS.readMain();
-
-        // Recompute master table (Percent + Finish Date)
         SAVINGS.recomputeMain(savingsSh, mainRows);
-
-        // Update month table
-        const mSh = ss.getSheetByName(CFG.singleMonth.sheet);
-        if (mSh) {
-          const y = _.year();
-          const mIdx = _.monthIdx();
-          SAVINGS.populateMonth(mSh, y, mIdx, true, mainRows);
-          Savings_RecomputeMonthFromMonthOnly();
-        }
-
-        // Update tiles
+        const mSh = ssLoc.getSheetByName(CFG.singleMonth.sheet);
+        if (mSh) SAVINGS.populateMonth(mSh, _.year(), _.monthIdx(), true, mainRows);
         SAVINGS.recomputeTiles(savingsSh, mainRows);
         return;
       }
     }
   }
 
-  // === DATED ACCOUNT BALANCE ===
+  // ========== 4) Dated Account Balance sheet ==========
   if (name === D.sheet){
     const tCell = sh.getRange(D.targetDate);
     const tRow  = tCell.getRow();
     const tCol  = tCell.getColumn();
+    const A = D.accounts;
 
-    // H2 date changed → refresh but preserve actuals
-    if (row === tRow && col === tCol) {
-      try {
-        DATED_ACCOUNT_BALANCE.refreshSourceData(false);
-        DATED_ACCOUNT_BALANCE.updateDatedAccountBalance();
-      } catch(_) {}
-      return;
-    }
-
-    // Any edit in expenses/transfers/income subtables → recompute
-    if ((row >= D.expenses.rowStart && row <= D.expenses.rowEnd) ||
-        (row >= D.transfers.rowStart && row <= D.transfers.rowEnd) ||
-        (row >= D.income.rowStart    && row <= D.income.rowEnd)) {
+    if (row >= A.rowStart && row <= A.rowEnd && col === _.c(A.colStartBalance)) {
       try { DATED_ACCOUNT_BALANCE.updateDatedAccountBalance(); } catch(_) {}
       return;
     }
+
+    if (row === tRow && col === tCol) {
+      try { DATED_ACCOUNT_BALANCE.refreshSourceData(true); } catch(_) {}
+      return;
+    }
+
+    if ((row >= D.expenses.rowStart && row <= D.expenses.rowEnd) ||
+        (row >= D.transfers.rowStart && row <= D.transfers.rowEnd) ||
+        (row >= D.income.rowStart && row <= D.income.rowEnd)) {
+      try { DATED_ACCOUNT_BALANCE.updateDatedAccountBalance(); } catch(_) {}
+      return;
+    }
+
+    if (row >= A.rowStart && row <= A.rowEnd && col === _.c(A.colName)) {
+      try { WarnDupes_UpdateAll(); } catch(_) {}
+    }
   }
 
-  // Transfers sheet edit → recompute dated + month
+  // ========== 5) Transfers sheet → refresh dated, bank/category, calendar (COOLDOWN) ==========
   if (name === CFG.transfersPayments.sheet){
-    try {
-      DATED_ACCOUNT_BALANCE.refreshSourceData(false);
-      DATED_ACCOUNT_BALANCE.updateDatedAccountBalance();
-      Monthly_UpdateBankAndCategoryFormatting();
-    } catch(_) {}
+    const TP = CFG.transfersPayments;
+    if (row >= TP.rowStart && row <= TP.rowEnd) {
+      if (_shouldRun_("__cooldown_transfers__", 400)) {
+        try {
+          DATED_ACCOUNT_BALANCE.refreshSourceData(false);
+          Monthly_UpdateBankAndCategoryFormatting();
+          Monthly_RenderCalendar_Safe();
+        } catch(_) {}
+      }
+    }
     return;
   }
 
-  // AEP change in any dated subtable → recompute dated
-  if ((row >= D.expenses.rowStart && row <= D.expenses.rowEnd && (col === _.c(D.expenses.colPred) || col === _.c(D.expenses.colAct))) ||
-      (row >= D.transfers.rowStart && row <= D.transfers.rowEnd && (col === _.c(D.transfers.colPred) || col === _.c(D.transfers.colAct))) ||
-      (row >= D.income.rowStart    && row <= D.income.rowEnd    && (col === _.c(D.income.colPred)    || col === _.c(D.income.colAct)))) {
-    try { DATED_ACCOUNT_BALANCE.updateDatedAccountBalance(); } catch(_) {}
-    return;
-  }
-
-  // Include checkbox toggled in any dated subtable → recompute dated
-  if ((row >= D.expenses.rowStart  && row <= D.expenses.rowEnd  && col === _.c(D.expenses.colInclude)) ||
-      (row >= D.transfers.rowStart && row <= D.transfers.rowEnd && col === _.c(D.transfers.colInclude)) ||
-      (row >= D.income.rowStart    && row <= D.income.rowEnd    && col === _.c(D.income.colInclude))) {
-    try { DATED_ACCOUNT_BALANCE.updateDatedAccountBalance(); } catch(_) {}
-    return;
-  }
-
-  // Warn dupes on account name edits
-  if (name === CFG.singleMonth.sheet){
-    const B = CFG.bank;
-    if (row>=B.rowStart && row<=B.rowEnd && col===_.c(B.colName)) { try{ WarnDupes_UpdateAll(); }catch(_){ } }
-  }
-  if (name === D.sheet){
-    const A = D.accounts;
-    if (row>=A.rowStart && row<=A.rowEnd && col===_.c(A.colName)) { try{ WarnDupes_UpdateAll(); }catch(_){ } }
-  }
-
-  // Master expenses change → rebuild month + visuals + dated
+  // ========== 6) Master expenses → repopulate Month + calendar + tiles ==========
   if (name === CFG.expenses.master.sheet){
-    const mSh = SpreadsheetApp.getActive().getSheetByName(CFG.singleMonth.sheet);
+    const ssLoc = __ss();
+    const mSh = ssLoc.getSheetByName(CFG.singleMonth.sheet);
     if (mSh){
-      const y=_.year(), mIdx=_.monthIdx();
-      EXPENSES.populateMonth(mSh, y, mIdx, true, EXPENSES.readMaster());
+      EXPENSES.populateMonth(mSh, _.year(), _.monthIdx(), true, EXPENSES.readMaster());
+      Monthly_RenderCalendar_Safe();
       Expenses_UpdateSheetTiles();
-      DATED_ACCOUNT_BALANCE.refreshSourceData(false);
-      DATED_ACCOUNT_BALANCE.updateDatedAccountBalance();
     }
     return;
   }
 
-  // Month edits (expenses table) → calendar + tiles/rollups
+  // ========== 7) SINGLE MONTH sheet (COOLDOWNS) ==========
   if (name === CFG.singleMonth.sheet){
-    const ET = CFG.monthly.expenseTable;
-    const inExpenseTable = row >= ET.rowStart && row <= ET.rowEnd;
-    if (inExpenseTable) { Monthly_RenderCalendar(); }
+    const M = CFG.savings.monthly;
+    const ET = CFG.expenses.monthly;
+    const B = CFG.bank;
+    const markCol = (CFG.creditCards && CFG.creditCards.bankMarkCol) || "O";
 
-    _updateTilesOnly();
-
-    const ss = SpreadsheetApp.getActive();
-    const savingsSh = ss.getSheetByName(CFG.savings.sheet);
-    if (savingsSh) {
-      const main = SAVINGS.readMain();
-      SAVINGS.recomputeMain(savingsSh, main);
-      SAVINGS.recomputeTiles(savingsSh, main);
+    if (row >= M.rowStart && row <= M.rowEnd) {
+      try { Savings_RecomputeMonthFromMonthOnly(); } catch(err) { Logger.log("Savings error: " + err); }
     }
-    // inside the SingleMonth onEdit handler branch (you already have this block)
-SpreadsheetApp.flush();
-try { Monthly_UpdateBankAndCategoryFormatting(); } catch(_){}
 
-    updateIncomeTiles();
-    Expenses_UpdateSheetTiles();
+    if (row >= B.rowStart && row <= B.rowEnd && col === _.c(markCol)) {
+      try { Lists_SyncCreditCardPayment(); } catch(_) {}
+    }
+
+    if (row >= ET.rowStart && row <= ET.rowEnd) {
+      if (_shouldRun_("__cooldown_calendar__", 400)) {
+        try { Monthly_RenderCalendar_Safe(); } catch(e) { Logger.log("Calendar error: " + e); }
+      }
+    }
+
+    if (row >= B.rowStart && row <= B.rowEnd && col === _.c(B.colName)) {
+      try { WarnDupes_UpdateAll(); } catch(_) {}
+    }
+
+    try {
+      const ssLoc2 = __ss();
+      const savingsSh = ssLoc2.getSheetByName(CFG.savings.sheet);
+      if (savingsSh) {
+        const main = SAVINGS.readMain();
+        SAVINGS.recomputeMain(savingsSh, main);
+        SAVINGS.recomputeTiles(savingsSh, main);
+      }
+    } catch(e){ Logger.log(e); }
+
+    SpreadsheetApp.flush();
+
+    if (_shouldRun_("__cooldown_bank_tiles__", 400)) {
+      try { Monthly_UpdateBankAndCategoryFormatting(); } catch(_){}
+      try { updateIncomeTiles && updateIncomeTiles(); } catch(_){}
+      try { Expenses_UpdateSheetTiles && Expenses_UpdateSheetTiles(); } catch(_){}
+    }
     return;
   }
 
-  // Income tiles sheet edit → rebuild paychecks + month + tiles + dated
+  // ========== 8) Income tiles sheet → rebuild paychecks, repopulate month, refresh ==========
   if (name === CFG.income.tiles.sheet){
     try { PAYCHECKS.rebuild(); } catch(_){}
-    const mSh = SpreadsheetApp.getActive().getSheetByName(CFG.singleMonth.sheet);
-    if (mSh){
-      const y=_.year(), mIdx=_.monthIdx();
-      INCOME.populateMonth(mSh, y, mIdx, true, INCOME.readMaster());
-    }
-    _updateTilesOnly();
-    updateIncomeTiles();
-    Expenses_UpdateSheetTiles();
-    DATED_ACCOUNT_BALANCE.refreshSourceData(false);
-    DATED_ACCOUNT_BALANCE.updateDatedAccountBalance();
+    const ssLoc = __ss();
+    const mSh = ssLoc.getSheetByName(CFG.singleMonth.sheet);
+    if (mSh) INCOME.populateMonth(mSh, _.year(), _.monthIdx(), true, INCOME.readMaster());
+    try { Monthly_UpdateBankAndCategoryFormatting(); } catch(_){}
+    try { updateIncomeTiles(); } catch(_){}
+    try { Expenses_UpdateSheetTiles(); } catch(_){}
     return;
   }
 
-  // Expenses tiles “refresh all” button
+  // ========== 9) Expenses tiles sheet → full orchestration ==========
   if (name === CFG.expenses.tiles.sheet){
     updateAll();
     return;
   }
 
-  // Paychecks sheet edit → propagate
+  // ========== 10) Paychecks sheet → sync dated income & refresh (CACHE-BUST + COOLDOWN ok) ==========
   if (name === CFG.income.paychecks.sheet){
+    // paycheck cache bust (year list)
+    try { CacheService.getDocumentCache().remove("paychecks:" + _.year()); } catch(_){}
     const P = CFG.income.paychecks;
     if (row>=P.rowStart && row<=P.rowEnd && [_.c(P.colName), _.c(P.colDate), _.c(P.colPred)].includes(col)){
       DatedIncome_UpsertFromPaychecks();
@@ -3701,16 +4747,6 @@ try { Monthly_UpdateBankAndCategoryFormatting(); } catch(_){}
     }
   }
 }
-
-function debugSheetNames() {
-  const ss = SpreadsheetApp.getActive();
-  const sheets = ss.getSheets();
-  Logger.log("=== ALL SHEET NAMES ===");
-  sheets.forEach(function(sheet) {
-    Logger.log("Sheet: '" + sheet.getName() + "'");
-  });
-}
-
 
 /* ============================= MENU ============================= */
 function createBudgetToolsMenu() {
